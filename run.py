@@ -664,7 +664,7 @@ def process_disk(mri_data: np.ndarray, mask_data: np.ndarray, disk_label: int, c
         angle_deg = compute_principal_angle(mask_crop == disk_label)
         rotated_mri, rotated_mask = rotate_volume_and_mask(mri_crop, mask_crop, angle_deg)
 
-        create_sagittal_bmp_images(rotated_mri, rotated_mask, output_dir, logger, slice_axis=0, variation=0, show_labels=False)
+        # create_sagittal_bmp_images(rotated_mri, rotated_mask, output_dir, logger, slice_axis=0, variation=0, show_labels=False)
 
         mean = rotated_mri.mean()
         std = rotated_mri.std() if rotated_mri.std() > 0 else 1.0
