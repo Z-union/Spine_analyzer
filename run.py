@@ -664,6 +664,8 @@ def process_disk(mri_data: np.ndarray, mask_data: np.ndarray, disk_label: int, c
         angle_deg = compute_principal_angle(mask_crop == disk_label)
         rotated_mri, rotated_mask = rotate_volume_and_mask(mri_crop, mask_crop, angle_deg)
 
+        create_sagittal_bmp_images(rotated_mri, rotated_mask, output_dir, logger, slice_axis=0, variation=0, show_labels=False)
+
         mean = rotated_mri.mean()
         std = rotated_mri.std() if rotated_mri.std() > 0 else 1.0
         img = (rotated_mri - mean) / std
@@ -789,13 +791,13 @@ def parse_args():
     return parser.parse_args()
 
 def pick_best(scan_tuple):
-    # Затем ищем T2 без подавления жира (приоритет над T2 с FS)
-    if scan_tuple[1] is not None:  # T2
-        return scan_tuple[1]
-
     # Сначала ищем T1
     if scan_tuple[0] is not None:  # T1
         return scan_tuple[0]
+
+    # Затем ищем T2 без подавления жира (приоритет над T2 с FS)
+    if scan_tuple[1] is not None:  # T2
+        return scan_tuple[1]
 
     # Наконец, ищем STIR
     if scan_tuple[2] is not None:  # STIR
@@ -893,7 +895,9 @@ def run_segmentation_pipeline(args, logger=None) -> tuple:
             nifti_seg = iterative_label(**iterative_label_params)
             nifti_seg = fill_canal(nifti_seg, canal_label=2, cord_label=1)
             nifti_seg = transform_seg2image(sag_scan, nifti_seg)
-            nifti_img = crop_image2seg(sag_scan, nifti_seg, margin=DEFAULT_CROP_MARGIN)
+            sagittals = [crop_image2seg(sag, nifti_seg, margin=DEFAULT_CROP_MARGIN) if sag is not None else None for sag in sag_scans]
+            # nifti_img = crop_image2seg(sag_scan, nifti_seg, margin=DEFAULT_CROP_MARGIN)
+            nifti_img = pick_best(sagittals)
             nifti_seg = transform_seg2image(nifti_img, nifti_seg)
             if step == 'step_1':
                 nifti_seg = extract_alternate(nifti_seg, labels=EXTRACT_LABELS_RANGE)
@@ -906,6 +910,8 @@ def run_segmentation_pipeline(args, logger=None) -> tuple:
         save(nifti_seg, 'sagittal_segmentation.nii.gz')
         if logger:
             logger.info("Обработанные сагиттальные файлы сохранены: sagittal_processed.nii.gz, sagittal_segmentation.nii.gz")
+
+        # sagittals = [crop_image2seg(sag, nifti_seg, margin=DEFAULT_CROP_MARGIN) for sag in sag_scans if sag is not None]
     else:
         if logger:
             logger.warning("Сагиттальный скан не найден. Сегментация сагиттала пропущена.")
@@ -952,8 +958,8 @@ def run_segmentation_pipeline(args, logger=None) -> tuple:
             logger.warning("Аксиальный скан не найден. Сегментация аксиала пропущена.")
 
     # Возвращаем только то, что есть (приоритет: сагиттал -> аксиал)
-    if nifti_img is not None and nifti_seg is not None:
-        return nifti_img, nifti_seg
+    if sagittals is not None and nifti_seg is not None:
+        return sagittals, nifti_seg
     elif ax_scan is not None:
         # Вернуть аксиальные результаты (если нужно)
         return axial, ax_seg_nifti
@@ -1222,7 +1228,7 @@ def detect_continuous_herniation(herniation_candidates: np.ndarray, disk_mask: n
         return np.zeros_like(herniation_candidates, dtype=bool)
 
 
-def create_sagittal_bmp_images(nifti_img: Nifti1Image, nifti_seg: Nifti1Image, output_dir: Path, logger=None, slice_axis=0, variation=0):
+def create_sagittal_bmp_images(nifti_img: Nifti1Image, nifti_seg: Nifti1Image, output_dir: Path, logger=None, slice_axis=0, variation=0, show_labels=True):
     """
     Создает BMP изображения с подписанными позвонками для каждого среза.
     
@@ -1232,6 +1238,7 @@ def create_sagittal_bmp_images(nifti_img: Nifti1Image, nifti_seg: Nifti1Image, o
     :param logger: Logger для записи сообщений
     :param slice_axis: Ось для нарезки (0=X, 1=Y, 2=Z), по умолчанию 0
     :param variation: Вариация отображения (0=контуры, 1=заливка, 2=контуры+заливка)
+    :param show_labels: Показывать ли подписи (позвонки и справочная информация)
     """
     try:
         # Создаем папку для BMP изображений
@@ -1241,10 +1248,16 @@ def create_sagittal_bmp_images(nifti_img: Nifti1Image, nifti_seg: Nifti1Image, o
         if logger:
             logger.info(f"Создаем BMP изображения в папке: {bmp_dir}")
             logger.info(f"Ось нарезки: {slice_axis}, вариация: {variation}")
-        
+
         # Получаем данные
-        img_data = nifti_img.get_fdata()
-        seg_data = nifti_seg.get_fdata()
+        if hasattr(nifti_img, 'get_fdata'):
+            img_data = nifti_img.get_fdata()
+        else:
+            img_data = np.asarray(nifti_img)
+        if hasattr(nifti_seg, 'get_fdata'):
+            seg_data = nifti_seg.get_fdata()
+        else:
+            seg_data = np.asarray(nifti_seg)
         
         # Словарь для описания позвонков (не дисков)
         vertebra_descriptions = {
@@ -1357,75 +1370,57 @@ def create_sagittal_bmp_images(nifti_img: Nifti1Image, nifti_seg: Nifti1Image, o
                 pil_image = Image.fromarray(rgb_image)
                 draw = ImageDraw.Draw(pil_image)
                 
-                # Пытаемся загрузить шрифт, если не получится - используем стандартный
-                try:
-                    font_large = ImageFont.truetype("arial.ttf", 12)  # Для позвонков (уменьшено)
-                    font_small = ImageFont.truetype("arial.ttf", 10)  # Для остального
-                except:
-                    font_large = ImageFont.load_default()
-                    font_small = ImageFont.load_default()
-                
-                # Добавляем подписи для найденных позвонков
-                found_vertebrae = []
-                for label_value in np.unique(seg_slice):
-                    if label_value in vertebra_descriptions:
-                        # Находим центр позвонка
-                        mask = (seg_slice == label_value)
-                        if np.any(mask):
-                            coords = np.argwhere(mask)
-                            center_y, center_x = coords.mean(axis=0).astype(int)
-                            
-                            # Добавляем подпись
-                            description = vertebra_descriptions[label_value]
-                            text_bbox = draw.textbbox((0, 0), description, font=font_large)
-                            text_width = text_bbox[2] - text_bbox[0]
-                            text_height = text_bbox[3] - text_bbox[1]
-                            
-                            # Позиция текста (смещение от центра)
-                            text_x = max(0, center_x - text_width // 2)
-                            text_y = max(0, center_y - text_height // 2)
-                            
-                            # Рисуем фон для текста
-                            draw.rectangle([text_x-2, text_y-2, text_x+text_width+2, text_y+text_height+2], 
-                                         fill=(0, 0, 0), outline=(255, 255, 255))
-                            
-                            # Рисуем текст
-                            draw.text((text_x, text_y), description, fill=(255, 255, 255), font=font_large)
-                            found_vertebrae.append(description)
-                
-                # --- Справочная информация в нижнем левом углу ---
-                axis_names = ['X', 'Y', 'Z']
-                slice_info = f"Slice {slice_idx+1}/{num_slices} ({axis_names[slice_axis]})"
-                variation_names = ['Контуры', 'Заливка', 'Контуры+Заливка']
-                variation_info = f"Вариация: {variation_names[variation]}"
-                vertebrae_info = f"Found: {', '.join(found_vertebrae)}" if found_vertebrae else ""
-                
-                # Собираем строки справки
-                info_lines = [slice_info, variation_info]
-                if vertebrae_info:
-                    info_lines.append(vertebrae_info)
-                
-                # Размеры изображения
-                img_w, img_h = pil_image.size
-                margin = 8
-                # Высота одной строки
-                line_height = font_small.getbbox("Ag")[3] - font_small.getbbox("Ag")[1] + 2
-                total_height = line_height * len(info_lines)
-                
-                # Координаты для первой строки (нижний левый угол)
-                info_x = margin
-                info_y = img_h - total_height - margin
-                
-                # Рисуем каждую строку справки
-                for i, line in enumerate(info_lines):
-                    y = info_y + i * line_height
-                    text_bbox = draw.textbbox((0, 0), line, font=font_small)
-                    text_width = text_bbox[2] - text_bbox[0]
-                    text_height = text_bbox[3] - text_bbox[1]
-                    # Фон
-                    draw.rectangle([info_x-2, y-2, info_x+text_width+2, y+text_height+2], fill=(0,0,0), outline=None)
-                    # Текст
-                    draw.text((info_x, y), line, fill=(255,255,255), font=font_small)
+                if show_labels:
+                    # Пытаемся загрузить шрифт, если не получится - используем стандартный
+                    try:
+                        font_large = ImageFont.truetype("arial.ttf", 12)  # Для позвонков (уменьшено)
+                        font_small = ImageFont.truetype("arial.ttf", 10)  # Для остального
+                    except:
+                        font_large = ImageFont.load_default()
+                        font_small = ImageFont.load_default()
+                    
+                    # Добавляем подписи для найденных позвонков
+                    found_vertebrae = []
+                    for label_value in np.unique(seg_slice):
+                        if label_value in vertebra_descriptions:
+                            # Находим центр позвонка
+                            mask = (seg_slice == label_value)
+                            if np.any(mask):
+                                coords = np.argwhere(mask)
+                                center_y, center_x = coords.mean(axis=0).astype(int)
+                                # Добавляем подпись
+                                description = vertebra_descriptions[label_value]
+                                text_bbox = draw.textbbox((0, 0), description, font=font_large)
+                                text_width = text_bbox[2] - text_bbox[0]
+                                text_height = text_bbox[3] - text_bbox[1]
+                                text_x = max(0, center_x - text_width // 2)
+                                text_y = max(0, center_y - text_height // 2)
+                                draw.rectangle([text_x-2, text_y-2, text_x+text_width+2, text_y+text_height+2], fill=(0, 0, 0), outline=(255, 255, 255))
+                                draw.text((text_x, text_y), description, fill=(255, 255, 255), font=font_large)
+                                found_vertebrae.append(description)
+                    # --- Справочная информация в нижнем левом углу ---
+                    axis_names = ['X', 'Y', 'Z']
+                    slice_info = f"Slice {slice_idx+1}/{num_slices} ({axis_names[slice_axis]})"
+                    variation_names = ['Контуры', 'Заливка', 'Контуры+Заливка']
+                    variation_info = f"Вариация: {variation_names[variation]}"
+                    vertebrae_info = f"Found: {', '.join(found_vertebrae)}" if found_vertebrae else ""
+                    info_lines = [slice_info, variation_info]
+                    if vertebrae_info:
+                        info_lines.append(vertebrae_info)
+                    img_w, img_h = pil_image.size
+                    margin = 8
+                    line_height = font_small.getbbox("Ag")[3] - font_small.getbbox("Ag")[1] + 2
+                    total_height = line_height * len(info_lines)
+                    info_x = margin
+                    info_y = img_h - total_height - margin
+                    for i, line in enumerate(info_lines):
+                        y = info_y + i * line_height
+                        text_bbox = draw.textbbox((0, 0), line, font=font_small)
+                        text_width = text_bbox[2] - text_bbox[0]
+                        text_height = text_bbox[3] - text_bbox[1]
+                        draw.rectangle([info_x-2, y-2, info_x+text_width+2, y+text_height+2], fill=(0,0,0), outline=None)
+                        draw.text((info_x, y), line, fill=(255,255,255), font=font_small)
+                # Если show_labels == False, не рисуем подписи вообще
                 
                 # Сохраняем BMP
                 bmp_filename = f"sagittal_slice_{slice_idx+1:03d}.bmp"
@@ -1477,11 +1472,9 @@ def main():
         logger.info(f"Тип устройства: {DEVICE}")
         
         nifti_img, nifti_seg = run_segmentation_pipeline(args, logger)
-        save(nifti_img, 'sagittal_processed.nii.gz')
-        save(nifti_seg, 'sagittal_segmentation.nii.gz')
         if logger:
             logger.info("Обработанные сагиттальные файлы сохранены: sagittal_processed.nii.gz, sagittal_segmentation.nii.gz")
-        
+        nifti_img = nifti_img[1]
         # Анализируем, какие диски присутствуют в сегментации
         seg_data = nifti_seg.get_fdata()
         unique_labels = np.unique(seg_data)
