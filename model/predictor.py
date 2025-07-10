@@ -26,6 +26,10 @@ def internal_predict_sliding_window_return_logits(
                  где C_out = self.label_manager.num_segmentation_heads.
     """
 
+    # Приводим results_device к строке, если это torch.device
+    if isinstance(results_device, torch.device):
+        results_device = str(results_device)
+
     data = torch.from_numpy(data)
     data = data.to(results_device)
     predicted_logits = n_predictions = prediction = gaussian = workon = None

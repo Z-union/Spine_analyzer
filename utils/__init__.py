@@ -4,3 +4,4 @@ from .reorient_canonical import reorient_canonical, recalculate_correspondence
 from .resample import resample
 from .preprocessor import DefaultPreprocessor, largest_component
 from .iterative_label import iterative_label, extract_levels, transform_seg2image, extract_alternate, fill_canal, crop_image2seg
+from .constant import *

@@ -14,6 +14,9 @@ def resample(med_data: list, mm: tuple = (1.0, 1.0, 1.0)) -> list:
     """
     res = []
     for image in med_data:
+        if image is None:
+            res.append(None)
+            continue
         # Get image dtype from the image data (preferred over header dtype to avoid data loss)
         image_data_dtype = getattr(np, np.asanyarray(image.dataobj).dtype.name)
 

@@ -12,8 +12,11 @@ def average4d(med_data: list) -> list:
     :return: Список усреднённых 3D-изображений (nibabel.Nifti1Image)
     """
     res = []
-    for data in med_data:
-        image = data.to_nifti()
+    for image in med_data:
+        if image is None:
+            res.append(None)
+            continue
+        image = image.to_nifti()
         # Get image dtype from the image data (preferred over header dtype to avoid data loss)
         image_data_dtype = getattr(np, np.asanyarray(image.dataobj).dtype.name)
 
@@ -59,6 +62,5 @@ def _average4d(image: 'nibabel.nifti1.Nifti1Image') -> 'nibabel.nifti1.Nifti1Ima
         output_image_data = np.mean(output_image_data, axis=-1)
 
     output_image = nib.Nifti1Image(output_image_data, image.affine, image.header)
-    nib.save(output_image, 'orig_scan_resampled.nii.gz')
 
     return output_image

@@ -21,6 +21,9 @@ def reorient_canonical(med_data: list) -> list:
     """
     res = []
     for image in med_data:
+        if image is None:
+            res.append(None)
+            continue
 
         # Get image dtype from the image data (preferred over header dtype to avoid data loss)
         image_data_dtype = getattr(np, np.asanyarray(image.dataobj).dtype.name)

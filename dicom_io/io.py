@@ -8,6 +8,7 @@ import numpy as np
 from pydicom import dcmread, FileDataset, DataElement
 from pydicom.tag import Tag
 import nibabel as nib
+from nibabel.nifti1 import Nifti1Image
 
 
 @dataclass
@@ -44,12 +45,12 @@ class SpinalScan:
 
         return affine
 
-    def to_nifti(self) -> nib.Nifti1Image:
+    def to_nifti(self) -> Nifti1Image:
         """
         Convert to nibabel Nifti1Image.
 
         :return: NIfTI image object
-        :rtype: nib.Nifti1Image
+        :rtype: Nifti1Image
         """
         # Ensure volume is in (X, Y, Z) order
         vol = self.volume
@@ -57,7 +58,110 @@ class SpinalScan:
             # Heuristic: if not (X <= Y <= Z), try to transpose
             vol = np.ascontiguousarray(vol)
             vol = np.rot90(vol, 1, axes=(0, 1))
-        return nib.Nifti1Image(vol.astype(np.float32), affine=np.array(self.get_affine(), dtype=np.float64))
+        return Nifti1Image(vol.astype(np.float32), affine=np.array(self.get_affine(), dtype=np.float64))
+
+
+def get_sequence_type(dicom_file: FileDataset) -> Optional[str]:
+    """
+    Определяет тип последовательности (T1, T2, STIR) из DICOM метаданных.
+    
+    :param dicom_file: DICOM файл для анализа
+    :return: Тип последовательности ('T1', 'T2', 'STIR') или None если не удалось определить
+    """
+    try:
+        # Проверяем различные теги для определения типа последовательности
+        sequence_name = getattr(dicom_file, 'SequenceName', '').upper()
+        protocol_name = getattr(dicom_file, 'ProtocolName', '').upper()
+        series_description = getattr(dicom_file, 'SeriesDescription', '').upper()
+        
+        # Проверяем на T1
+        if any(keyword in sequence_name or keyword in protocol_name or keyword in series_description 
+               for keyword in ['T1', 'T1W', 'T1-WEIGHTED', 'T1_WEIGHTED', 'T1W_', 'T1_']):
+            return 'T1'
+        
+        # Проверяем на T2 (включая с подавлением жира)
+        if any(keyword in sequence_name or keyword in protocol_name or keyword in series_description 
+               for keyword in ['T2', 'T2W', 'T2-WEIGHTED', 'T2_WEIGHTED', 'T2W_', 'T2_', 'ST2W']):
+            return 'T2'
+        
+        # Проверяем на STIR
+        if any(keyword in sequence_name or keyword in protocol_name or keyword in series_description 
+               for keyword in ['STIR', 'SHORT TAU INVERSION RECOVERY', 'INVERSION RECOVERY']):
+            return 'STIR'
+        
+        # Дополнительные проверки по TE/TR
+        if hasattr(dicom_file, 'EchoTime') and hasattr(dicom_file, 'RepetitionTime'):
+            te = float(dicom_file.EchoTime)
+            tr = float(dicom_file.RepetitionTime)
+            
+            # Эвристики для определения типа по TE/TR
+            if tr < 1000:  # Короткий TR
+                if te < 30:
+                    return 'T1'
+                else:
+                    return 'T2'
+            else:  # Длинный TR
+                if te > 80:
+                    return 'T2'
+                else:
+                    return 'T1'
+        
+        return None
+        
+    except Exception:
+        return None
+
+
+def process_single_series(paths: List[Union[os.PathLike, str, bytes]], 
+                         require_extensions: bool = True,
+                         metadata_overwrites: Optional[dict] = None) -> Optional[SpinalScan]:
+    """
+    Обрабатывает одну серию DICOM-файлов и возвращает SpinalScan.
+    
+    :param paths: Список путей к DICOM-файлам
+    :param require_extensions: Проверять расширение .dcm
+    :param metadata_overwrites: Словарь для перезаписи метаданных
+    :return: SpinalScan или None если обработка не удалась
+    """
+    if metadata_overwrites is None:
+        metadata_overwrites = {}
+    
+    if not paths:
+        return None
+        
+    try:
+        if require_extensions:
+            for path in paths:
+                if not str(path).endswith(".dcm"):
+                    raise ValueError(f"Файл {path} не имеет расширения .dcm")
+
+        dicom_files = [dcmread(path) for path in paths]
+
+        for idx, dicom_file in enumerate(dicom_files):
+            dicom_files[idx] = overwrite_tags(dicom_file, metadata_overwrites)
+
+        for dicom_idx, dicom_file in enumerate(dicom_files):
+            missing_tags = check_missing_tags(dicom_file)
+            if missing_tags:
+                raise ValueError(f"В файле {paths[dicom_idx]} отсутствуют теги: {missing_tags}")
+
+        dicom_files.sort(key=lambda d: d.InstanceNumber)
+
+        pixel_spacing = [
+            *np.mean([np.array(d.PixelSpacing) for d in dicom_files], axis=0),
+            np.mean([float(d.SliceThickness) for d in dicom_files])
+        ]
+
+        volume = np.stack([d.pixel_array for d in dicom_files], axis=-1)
+
+        return SpinalScan(volume=np.mean(volume, axis=2) if volume.ndim == 4 else volume, 
+                         pixel_spacing=pixel_spacing,
+                         iop=np.array(dicom_files[0].ImageOrientationPatient, dtype=np.float64),
+                         ipps=np.array([dicom_file.ImagePositionPatient for dicom_file in dicom_files],
+                                      dtype=np.float64))
+    except Exception as e:
+        print(f"Ошибка при обработке серии: {e}")
+        return None
 
 
 def load_dicoms(
@@ -284,8 +388,8 @@ def load_dicoms_from_folder(
     if metadata_overwrites is None:
         metadata_overwrites = {}
 
-    slices_sag = [f for f in glob.glob(os.path.join(args.input_sag, "*")) if is_dicom_file(f)]
-    slices_ax = [f for f in glob.glob(os.path.join(args.input_ax, "*")) if is_dicom_file(f)]
+    slices_sag: List[Union[os.PathLike, str, bytes]] = [f for f in glob.glob(os.path.join(args.input_sag, "*")) if is_dicom_file(f)]
+    slices_ax: List[Union[os.PathLike, str, bytes]] = [f for f in glob.glob(os.path.join(args.input_ax, "*")) if is_dicom_file(f)]
 
     return load_dicoms(slices_sag, slices_ax, require_extensions, metadata_overwrites)
 
@@ -294,30 +398,17 @@ def load_study_dicoms(
     study_folder: str,
     require_extensions: bool = True,
     metadata_overwrites: Optional[Dict] = None,
-) -> Tuple[Tuple[SpinalScan, SpinalScan], list]:
+) -> Tuple[Tuple[Tuple[Optional[SpinalScan], Optional[SpinalScan], Optional[SpinalScan]],
+                Tuple[Optional[SpinalScan], Optional[SpinalScan], Optional[SpinalScan]],
+                Tuple[Optional[SpinalScan], Optional[SpinalScan], Optional[SpinalScan]]], list]:
     '''
     Загружает DICOM-сканы на уровне исследования (study):
-    - выбирает аксиальную и сагиттальную серии
-    - строит таблицу соответствия срезов по координатам
-
-    Параметры
-    ----------
-    study_folder : str
-        Путь к папке с DICOM-файлами исследования.
-    require_extensions : bool
-        Проверять ли расширение .dcm.
-    metadata_overwrites : dict
-        Словарь для перезаписи метаданных.
-
-    Возвращает
-    -------
-    Tuple[SpinalScan, SpinalScan, list]
-        (SpinalScan сагиттальный, SpinalScan аксиальный, таблица соответствия)
+    - возвращает для каждой проекции (Sagittal, Axial, Coronal) по три режима (T1, T2, STIR)
+    - если режима нет, возвращает None
     '''
     if metadata_overwrites is None:
         metadata_overwrites = {}
 
-    # Рекурсивно собрать все DICOM-файлы
     dicom_paths = [f for f in glob.glob(os.path.join(study_folder, '**', '*'), recursive=True) if os.path.isfile(f) and is_dicom_file(f)]
     if not dicom_paths:
         raise ValueError(f"В папке {study_folder} не найдено DICOM-файлов")
@@ -333,50 +424,90 @@ def load_study_dicoms(
         except Exception as e:
             continue
 
-    # Определить типы серий (только чистые серии одной проекции)
-    sag_paths, ax_paths = None, None
-    for uid, paths in series_dict.items():
-        try:
-            sagittal_count = 0
-            axial_count = 0
-            for p in paths:
-                try:
-                    dcm = dcmread(p, stop_before_pixels=True)
-                    if is_sagittal_dicom_slice(dcm):
-                        sagittal_count += 1
-                    elif is_axial_dicom_slice(dcm):
-                        axial_count += 1
-                except Exception:
+    # Для каждой проекции и режима ищем подходящую серию
+    def find_series(series_dict, is_sagittal=None, is_axial=None, is_coronal=None, seq_type=None):
+        for uid, paths in series_dict.items():
+            try:
+                # Проверяем первый срез серии на локализатор
+                first_dcm = dcmread(paths[0], stop_before_pixels=True)
+                if is_localizer_series(first_dcm):
                     continue
-            if sagittal_count == len(paths) and sag_paths is None:
-                sag_paths = paths
-                print(f"Выбрана сагиттальная серия: {uid} ({len(paths)} файлов)")
-            elif axial_count == len(paths) and ax_paths is None:
-                ax_paths = paths
-                print(f"Выбрана аксиальная серия: {uid} ({len(paths)} файлов)")
-            # Если есть смешение — пропускаем
-        except Exception as e:
-            print(f"Ошибка при анализе серии {uid}: {e}")
-            continue
-        if sag_paths and ax_paths:
+                # Проверяем все срезы в серии, а не только первый
+                sagittal_slices = []
+                axial_slices = []
+                coronal_slices = []
+                
+                for path in paths:
+                    dcm = dcmread(path, stop_before_pixels=True)
+                    
+                    # Проверяем тип последовательности
+                    if seq_type and get_sequence_type(dcm) != seq_type:
+                        continue
+                    
+                    # Группируем срезы по проекции
+                    if is_sagittal_dicom_slice(dcm):
+                        sagittal_slices.append(path)
+                    elif is_axial_dicom_slice(dcm):
+                        axial_slices.append(path)
+                    elif is_coronal:
+                        # Если не сагиттальный и не аксиальный, считаем корональным
+                        coronal_slices.append(path)
+                
+                # Возвращаем срезы нужной проекции
+                if is_sagittal and sagittal_slices:
+                    return sagittal_slices
+                elif is_axial and axial_slices:
+                    return axial_slices
+                elif is_coronal and coronal_slices:
+                    return coronal_slices
+                    
+            except Exception:
+                continue
+        return None
+
+    # Для каждой проекции и режима
+    seqs = ['T1', 'T2', 'STIR']
+    sag_scans = []
+    ax_scans = []
+    cor_scans = []
+    for seq in seqs:
+        sag_paths = find_series(series_dict, is_sagittal=True, seq_type=seq)
+        ax_paths = find_series(series_dict, is_axial=True, seq_type=seq)
+        cor_paths = find_series(series_dict, is_coronal=True, seq_type=seq)
+        
+        # Используем новую функцию process_single_series вместо load_dicoms
+        sag_scan = process_single_series(sag_paths, require_extensions, metadata_overwrites) if sag_paths else None
+        ax_scan = process_single_series(ax_paths, require_extensions, metadata_overwrites) if ax_paths else None
+        cor_scan = process_single_series(cor_paths, require_extensions, metadata_overwrites) if cor_paths else None
+        
+        sag_scans.append(sag_scan)
+        ax_scans.append(ax_scan)
+        cor_scans.append(cor_scan)
+
+    # correspondence только для основной пары (например, T2)
+    # Найти первую непустую пару для correspondence
+    correspondence = []
+    for i, (sag, ax) in enumerate(zip(sag_scans, ax_scans)):
+        if sag is not None and ax is not None:
+            # Сопоставление срезов по координатам (используем Z-координату)
+            sag_ipps = np.array([dcmread(p, stop_before_pixels=True).ImagePositionPatient for p in series_dict[list(series_dict.keys())[i]]])
+            ax_ipps = np.array([dcmread(p, stop_before_pixels=True).ImagePositionPatient for p in series_dict[list(series_dict.keys())[i]]])
+            sag_z = sag_ipps[:, 2]
+            ax_z = ax_ipps[:, 2]
+            for j, sz in enumerate(sag_z):
+                k = np.argmin(np.abs(ax_z - sz))
+                distance = np.abs(ax_z[k] - sz)
+                correspondence.append((j, k, sz, ax_z[k], distance))
             break
 
-    if sag_paths is None or ax_paths is None:
-        raise ValueError("Не удалось найти обе серии: аксиальную и сагиттальную")
+    return ((tuple(sag_scans), tuple(ax_scans), tuple(cor_scans)), correspondence)
 
-    # Загрузить SpinalScan через существующий пайплайн
-    sag_scan, ax_scan = load_dicoms(sag_paths, ax_paths, require_extensions, metadata_overwrites)
 
-    # Сопоставление срезов по координатам (используем Z-координату)
-    sag_ipps = np.array([dcmread(p, stop_before_pixels=True).ImagePositionPatient for p in sag_paths])
-    ax_ipps = np.array([dcmread(p, stop_before_pixels=True).ImagePositionPatient for p in ax_paths])
-    sag_z = sag_ipps[:, 2]
-    ax_z = ax_ipps[:, 2]
-    correspondence = []
-    for i, sz in enumerate(sag_z):
-        # Найти ближайший аксиальный срез по Z
-        j = np.argmin(np.abs(ax_z - sz))
-        distance = np.abs(ax_z[j] - sz)
-        correspondence.append((i, j, sz, ax_z[j], distance))
-
-    return (sag_scan, ax_scan), correspondence
+def is_localizer_series(dicom_file: FileDataset) -> bool:
+    desc_fields = [
+        getattr(dicom_file, 'SeriesDescription', '').upper(),
+        getattr(dicom_file, 'ProtocolName', '').upper(),
+        getattr(dicom_file, 'SequenceName', '').upper()
+    ]
+    keywords = ['LOCALIZER', 'LOC', 'SCOUT', 'SURVEY', 'PLANNING', 'REFERENCE', 'TOPO', 'POSITION', 'LOCALISATOR']
+    return any(any(kw in field for kw in keywords) for field in desc_fields)
