@@ -5,6 +5,7 @@ import csv
 import pandas as pd
 import logging
 import traceback
+import time
 
 import nibabel
 import numpy as np
@@ -783,7 +784,7 @@ def parse_args():
         '''),
         formatter_class=argparse.RawTextHelpFormatter
     )
-    parser.add_argument('--studies_folder', type=Path, help='The input DICOM folder containing the sagittal images.', default=Path(r'F:\WorkSpace\Z-Union\100 МРТ ПК\Абаев Тимур Асланбекович\26.07.22\PA000000'))
+    parser.add_argument('--studies_folder', type=Path, help='The input DICOM folder containing the sagittal images.', default=Path(r'ST000000'))
     parser.add_argument('--output', type=Path, help='The output folder where the segmentation results will be saved.', default=Path(r'./results'))
     return parser.parse_args()
 
@@ -1457,11 +1458,13 @@ def get_device():
         return torch.device('cpu')
 
 DEVICE = get_device()
+DEVICE = torch.device('cpu')
 
 def main():
     """
     Основная точка входа: парсинг аргументов, запуск пайплайна, обработка и сохранение ROI для каждого диска.
     """
+    start_time = time.time()
     try:
         args = parse_args()
         output_dir = args.output
@@ -1472,6 +1475,7 @@ def main():
         logger.info("Запуск анализа позвоночника")
         logger.info(f"Входная папка: {args.studies_folder}")
         logger.info(f"Выходная папка: {output_dir}")
+        logger.info(f"Тип устройства: {DEVICE}")
         
         nifti_img, nifti_seg = run_segmentation_pipeline(args, logger)
         save(nifti_img, 'sagittal_processed.nii.gz')
@@ -1558,6 +1562,10 @@ def main():
         # Создаем BMP изображения с подписанными позвонками
         # По умолчанию режем по оси 0 (X) для сагиттальной проекции, вариация 0 (контуры)
         create_sagittal_bmp_images(nifti_img, nifti_seg, output_dir, logger, slice_axis=0, variation=0)
+        
+        # В конце main, после всех обработок:
+        elapsed = time.time() - start_time
+        logger.info(f"Время обработки: {elapsed:.1f} секунд ({elapsed/60:.2f} минут)")
         
     except Exception as e:
         if logger:
