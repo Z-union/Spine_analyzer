@@ -1458,7 +1458,6 @@ def get_device():
         return torch.device('cpu')
 
 DEVICE = get_device()
-DEVICE = torch.device('cpu')
 
 def main():
     """
