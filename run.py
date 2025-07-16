@@ -20,6 +20,7 @@ from scipy.ndimage import binary_closing, binary_opening
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from PIL import Image, ImageDraw, ImageFont
+import os
 
 from utils import pad_nd_image, average4d, reorient_canonical, resample, DefaultPreprocessor, largest_component, iterative_label, transform_seg2image, extract_alternate, fill_canal, crop_image2seg, recalculate_correspondence
 from model import internal_predict_sliding_window_return_logits, internal_get_sliding_window_slicers, GradingModel, BasicBlock, Bottleneck
@@ -177,6 +178,9 @@ def rotate_volume_and_mask(volume: np.ndarray, mask: np.ndarray, angle_deg: floa
     offset = center - rotation_matrix @ center
     rotated_volume = affine_transform(volume, rotation_matrix, offset=offset.tolist(), order=1)
     rotated_mask = affine_transform(mask, rotation_matrix, offset=offset.tolist(), order=0)
+
+    rotated_volume = np.rot90(rotated_volume, k=2, axes=(1, 2))
+    rotated_mask = np.rot90(rotated_mask, k=2, axes=(1, 2))
     return rotated_volume, rotated_mask
 
 
@@ -645,27 +649,24 @@ def process_disk(mri_data: np.ndarray, mask_data: np.ndarray, disk_label: int, c
     Возвращает (predictions, herniation_mask_global, bulging_mask_global) или None при ошибке.
     """
     try:
+        from utils.constant import VERTEBRA_DESCRIPTIONS
+        disk_human = VERTEBRA_DESCRIPTIONS.get(disk_label, '?')
         disk_mask = (mask_data == disk_label)
         if not np.any(disk_mask):
             if logger:
-                logger.warning(f"Диск {disk_label}: диск не найден в маске")
+                logger.warning(f"Диск {disk_label} ({disk_human}): диск не найден в маске")
             return None
-
         bbox = find_bounding_box(mask_data, disk_label)
         if bbox is None:
             if logger:
-                logger.warning(f"Диск {disk_label}: не удалось найти bounding box")
+                logger.warning(f"Диск {disk_label} ({disk_human}): не удалось найти bounding box")
             return None
-
         bbox_center = [((sl.start + sl.stop) // 2) for sl in bbox]
         slices = get_centered_slices(bbox_center, crop_shape, mask_data.shape)
         mri_crop = crop_and_pad(mri_data, slices, crop_shape)
         mask_crop = crop_and_pad(mask_data, slices, crop_shape)
         angle_deg = compute_principal_angle(mask_crop == disk_label)
         rotated_mri, rotated_mask = rotate_volume_and_mask(mri_crop, mask_crop, angle_deg)
-
-        # create_sagittal_bmp_images(rotated_mri, rotated_mask, output_dir, logger, slice_axis=0, variation=0, show_labels=False)
-
         mean = rotated_mri.mean()
         std = rotated_mri.std() if rotated_mri.std() > 0 else 1.0
         img = (rotated_mri - mean) / std
@@ -675,98 +676,85 @@ def process_disk(mri_data: np.ndarray, mask_data: np.ndarray, disk_label: int, c
         model.eval()
         with torch.no_grad():
             grading_outputs = model(img)
-
-        # Получаем предсказания как скалярные значения
         predictions = [torch.argmax(output).detach().cpu().numpy().item() for output in grading_outputs]
-
         if logger:
-            logger.info(f"Диск {disk_label}: исходные предсказания модели = {predictions}")
-
-        # Получаем spacing из nifti файла (в мм)
-        spacing_mm = tuple(nifti_img.header.get_zooms()[:3])  # Берем первые 3 измерения
+            logger.info(f"Диск {disk_label} ({disk_human}): исходные предсказания модели = {predictions}")
+        spacing_mm = tuple(nifti_img.header.get_zooms()[:3])
         if logger:
-            logger.info(f"Диск {disk_label}: spacing = {spacing_mm} мм")
-
-        # Если модель предсказала листез, измеряем его в миллиметрах
-        spondylolisthesis_predicted = predictions[IDX_SPONDY]  # Индекс 3 - Spondylolisthesis
+            logger.info(f"Диск {disk_label} ({disk_human}): spacing = {spacing_mm} мм")
+        spondylolisthesis_predicted = predictions[IDX_SPONDY]
         if logger:
-            logger.info(f"Диск {disk_label}: модель предсказала листез = {spondylolisthesis_predicted}")
-
+            logger.info(f"Диск {disk_label} ({disk_human}): модель предсказала листез = {spondylolisthesis_predicted}")
         if spondylolisthesis_predicted > 0:
             spondylolisthesis_mm = measure_spondylolisthesis(rotated_mri, rotated_mask, disk_label, spacing_mm=spacing_mm, logger=logger)
-            # Заменяем бинарное предсказание на измеренное значение в мм
             predictions[IDX_SPONDY] = spondylolisthesis_mm
             if logger:
-                logger.info(f"Диск {disk_label}: измеренный листез = {spondylolisthesis_mm:.1f} мм")
+                logger.info(f"Диск {disk_label} ({disk_human}): измеренный листез = {spondylolisthesis_mm:.1f} мм")
         else:
             if logger:
-                logger.info(f"Диск {disk_label}: модель не предсказала листез")
-
-        # Если модель предсказала грыжу или выбухание, определяем их локализацию
-        herniation_predicted = predictions[IDX_HERN]  # Индекс 4 - Disc herniation
-        bulging_predicted = predictions[IDX_BULGE]     # Индекс 6 - Disc bulging
-
+                logger.info(f"Диск {disk_label} ({disk_human}): модель не предсказала листез")
+        herniation_predicted = predictions[IDX_HERN]
+        bulging_predicted = predictions[IDX_BULGE]
         if logger:
-            logger.info(f"Диск {disk_label}: модель предсказала грыжу = {herniation_predicted}, выбухание = {bulging_predicted}")
-
+            logger.info(f"Диск {disk_label} ({disk_human}): модель предсказала грыжу = {herniation_predicted}, выбухание = {bulging_predicted}")
         herniation_volume = 0.0
         bulging_volume = 0.0
         herniation_size = 0.0
         bulging_size = 0.0
-
-        # Создаем маски для грыж и выбуханий
+        axis = 1
         herniation_mask = np.zeros_like(rotated_mask, dtype=bool)
         bulging_mask = np.zeros_like(rotated_mask, dtype=bool)
-
         if herniation_predicted > 0 or bulging_predicted > 0:
-            herniation_mask, bulging_mask, herniation_volume, bulging_volume, herniation_size, bulging_size = \
-                detect_herniation_bulging(rotated_mri, rotated_mask, disk_label, spacing_mm=spacing_mm, logger=logger)
+            proj_mask = detect_herniation_bulging_projection(rotated_mask, disk_label, logger=logger)
+            if herniation_predicted > 0:
+                herniation_mask = proj_mask
+            elif bulging_predicted > 0:
+                bulging_mask = proj_mask
+            # Не используем fallback! Если маска пустая — значит пустая.
+            voxel_volume_mm3 = spacing_mm[0] * spacing_mm[1] * spacing_mm[2]
+            if np.any(herniation_mask):
+                herniation_volume = np.sum(herniation_mask) * voxel_volume_mm3
+                coords = np.argwhere(herniation_mask)
+                if coords.size > 0:
 
-            # Помечаем на сегментации
+                    herniation_size = (coords[:, axis].max() - coords[:, axis].min() + 1) * spacing_mm[axis]
+            if np.any(bulging_mask):
+                bulging_volume = np.sum(bulging_mask) * voxel_volume_mm3
+                coords = np.argwhere(bulging_mask)
+                if coords.size > 0:
+
+                    bulging_size = (coords[:, axis].max() - coords[:, axis].min() + 1) * spacing_mm[axis]
             updated_mask = save_segmentation_with_herniations(
                 rotated_mask, disk_label, herniation_mask, bulging_mask, output_dir, logger
             )
-
-            # Сохраняем обновленную сегментацию для этого диска
             try:
-                # Создаем nifti изображение из обновленной маски
                 updated_nifti = Nifti1Image(updated_mask, nifti_img.affine, nifti_img.header)
-
-                # Сохраняем в папку результатов
                 seg_filename = f"seg_disk_{disk_label}_with_herniations.nii.gz"
                 seg_path = output_dir / seg_filename
                 save(updated_nifti, str(seg_path))
-
                 if logger:
-                    logger.info(f"Диск {disk_label}: сохранена сегментация с грыжами в {seg_path}")
-
+                    logger.info(f"Диск {disk_label} ({disk_human}): сохранена сегментация с грыжами в {seg_path}")
             except Exception as e:
                 if logger:
-                    logger.error(f"Ошибка при сохранении сегментации для диска {disk_label}: {e}")
-
-        # Трансформируем маски обратно в глобальные координаты
+                    logger.error(f"Ошибка при сохранении сегментации для диска {disk_label} ({disk_human}): {e}")
         herniation_mask_global = transform_mask_to_global(
             herniation_mask, slices, mask_data.shape, angle_deg, bbox_center, crop_shape
         )
         bulging_mask_global = transform_mask_to_global(
             bulging_mask, slices, mask_data.shape, angle_deg, bbox_center, crop_shape
         )
-
-        # Добавляем информацию о размерах к предсказаниям
         predictions.extend([herniation_volume, bulging_volume, herniation_size, bulging_size])
-
         if logger:
-            logger.info(f"Диск {disk_label}: финальные предсказания = {predictions}")
-            logger.info(f"Диск {disk_label}: объемы - грыжа: {herniation_volume:.1f} мм³, выбухание: {bulging_volume:.1f} мм³")
-            logger.info(f"Диск {disk_label}: размеры - грыжа: {herniation_size:.1f} мм, выбухание: {bulging_size:.1f} мм")
+            logger.info(f"Диск {disk_label} ({disk_human}): финальные предсказания = {predictions}")
+            logger.info(f"Диск {disk_label} ({disk_human}): объемы - грыжа: {herniation_volume:.1f} мм³, выбухание: {bulging_volume:.1f} мм³")
+            logger.info(f"Диск {disk_label} ({disk_human}): размеры - грыжа: {herniation_size:.1f} мм, выбухание: {bulging_size:.1f} мм")
             logger.info("-" * 50)
-
-        # Возвращаем кортеж с предсказаниями и масками в глобальных координатах
         return (predictions, herniation_mask_global, bulging_mask_global)
-
     except Exception as e:
+        from utils.constant import VERTEBRA_DESCRIPTIONS
+        disk_human = VERTEBRA_DESCRIPTIONS.get(disk_label, '?')
         if logger:
-            logger.error(f"Ошибка при обработке диска {disk_label}: {e}")
+            logger.error(f"Ошибка при обработке диска {disk_label} ({disk_human}): {e}")
             logger.error(f"Traceback: {traceback.format_exc()}")
         return None
 
@@ -786,7 +774,7 @@ def parse_args():
         '''),
         formatter_class=argparse.RawTextHelpFormatter
     )
-    parser.add_argument('--studies_folder', type=Path, help='The input DICOM folder containing the sagittal images.', default=Path(r'ST000000'))
+    parser.add_argument('--studies_folder', type=Path, help='The input DICOM folder containing the sagittal images.', default=Path(r'F:\WorkSpace\Z-Union\100 МРТ ПК\Абрамян Соня Самвеловна\DICOM\PA000000\ST000000'))
     parser.add_argument('--output', type=Path, help='The output folder where the segmentation results will be saved.', default=Path(r'./results'))
     return parser.parse_args()
 
@@ -953,6 +941,13 @@ def run_segmentation_pipeline(args, logger=None) -> tuple:
         save(ax_seg_nifti, 'axial_segmentation.nii.gz')
         if logger:
             logger.info("AX сегментация сохранена в axial_segmentation.nii.gz")
+
+        processed_axial = Nifti1Image(np.squeeze(processed_axial.get_fdata()), processed_axial.affine, processed_axial.header)
+        ax_seg_nifti = transform_seg2image(processed_axial, ax_seg_nifti)
+        processed_axial = crop_image2seg(processed_axial, ax_seg_nifti, margin=DEFAULT_CROP_MARGIN)
+        ax_seg_nifti = transform_seg2image(processed_axial, ax_seg_nifti)
+
+        # create_sagittal_bmp_images(processed_axial, ax_seg_nifti, Path(r'./results'), logger, slice_axis=0, variation=0, show_labels=False)
     else:
         if logger:
             logger.warning("Аксиальный скан не найден. Сегментация аксиала пропущена.")
@@ -1231,7 +1226,6 @@ def detect_continuous_herniation(herniation_candidates: np.ndarray, disk_mask: n
 def create_sagittal_bmp_images(nifti_img: Nifti1Image, nifti_seg: Nifti1Image, output_dir: Path, logger=None, slice_axis=0, variation=0, show_labels=True):
     """
     Создает BMP изображения с подписанными позвонками для каждого среза.
-    
     :param nifti_img: NIfTI изображение МРТ
     :param nifti_seg: NIfTI изображение сегментации
     :param output_dir: Папка для сохранения результатов
@@ -1244,11 +1238,9 @@ def create_sagittal_bmp_images(nifti_img: Nifti1Image, nifti_seg: Nifti1Image, o
         # Создаем папку для BMP изображений
         bmp_dir = output_dir / "segments" / "sag"
         bmp_dir.mkdir(parents=True, exist_ok=True)
-        
         if logger:
             logger.info(f"Создаем BMP изображения в папке: {bmp_dir}")
             logger.info(f"Ось нарезки: {slice_axis}, вариация: {variation}")
-
         # Получаем данные
         if hasattr(nifti_img, 'get_fdata'):
             img_data = nifti_img.get_fdata()
@@ -1258,137 +1250,78 @@ def create_sagittal_bmp_images(nifti_img: Nifti1Image, nifti_seg: Nifti1Image, o
             seg_data = nifti_seg.get_fdata()
         else:
             seg_data = np.asarray(nifti_seg)
-        
-        # Словарь для описания позвонков (не дисков)
         vertebra_descriptions = {
-            11: "C1",
-            12: "C2",
-            13: "C3",
-            14: "C4",
-            15: "C5",
-            16: "C6",
-            17: "C7",
-            21: "Th1",
-            22: "Th2",
-            23: "Th3",
-            24: "Th4",
-            25: "Th2",
-            26: "Th6",
-            27: "Th7",
-            28: "Th8",
-            29: "Th9",
-            30: "Th10",
-            31: "Th11",
-            32: "Th12",
-            41: "L1",
-            42: "L2",
-            43: "L3",
-            44: "L4",
-            45: "L5",
-            50: "S1",
+            11: "C1", 12: "C2", 13: "C3", 14: "C4", 15: "C5", 16: "C6", 17: "C7",
+            21: "Th1", 22: "Th2", 23: "Th3", 24: "Th4", 25: "Th2", 26: "Th6", 27: "Th7", 28: "Th8", 29: "Th9", 30: "Th10", 31: "Th11", 32: "Th12",
+            41: "L1", 42: "L2", 43: "L3", 44: "L4", 45: "L5", 50: "S1",
         }
-        
-        # Цвета для разных типов структур
         colors = COLORS
-        
-        # Проходим по всем срезам по указанной оси
         num_slices = img_data.shape[slice_axis]
-        
         if logger:
             logger.info(f"Создаем BMP для {num_slices} срезов по оси {slice_axis}")
-        
         for slice_idx in range(num_slices):
             try:
-                # Получаем срез МРТ и сегментации по указанной оси
                 if slice_axis == 0:
                     mri_slice = img_data[slice_idx, :, :]
                     seg_slice = seg_data[slice_idx, :, :]
                 elif slice_axis == 1:
                     mri_slice = img_data[:, slice_idx, :]
                     seg_slice = seg_data[:, slice_idx, :]
-                else:  # slice_axis == 2
+                else:
                     mri_slice = img_data[:, :, slice_idx]
                     seg_slice = seg_data[:, :, slice_idx]
-                
-                # Нормализуем МРТ срез для отображения
                 mri_normalized = ((mri_slice - mri_slice.min()) / (mri_slice.max() - mri_slice.min()) * 255).astype(np.uint8)
-                
-                # Поворачиваем изображение: только 90° против часовой стрелки
-                # (убираем разворот на 180°, чтобы не было вверх ногами)
                 mri_normalized = np.rot90(mri_normalized, k=1)
                 seg_slice = np.rot90(seg_slice, k=1)
-                # Отражаем по горизонтали, чтобы спина смотрела влево
                 mri_normalized = np.fliplr(mri_normalized)
                 seg_slice = np.fliplr(seg_slice)
-                
-                # Создаем RGB изображение
                 rgb_image = np.stack([mri_normalized, mri_normalized, mri_normalized], axis=2)
-                
-                # Накладываем сегментацию в зависимости от вариации
                 for label_value in np.unique(seg_slice):
-                    if label_value == 0:  # Пропускаем фон
+                    if label_value == 0:
                         continue
-                    
-                    # Определяем цвет в зависимости от метки
                     if label_value in vertebra_descriptions:
                         color = colors['vertebra']
-                    elif label_value in [1, 2]:  # Канал и спинной мозг
+                    elif label_value in [1, 2]:
                         color = colors['canal'] if label_value == 2 else colors['cord']
-                    elif label_value == 50:  # Крестец
+                    elif label_value == 50:
                         color = colors['sacrum']
-                    elif label_value == 200:  # Грыжа
+                    elif label_value == 200:
                         color = colors['hernia']
-                    elif label_value == 201:  # Выбухание
+                    elif label_value == 201:
                         color = colors['bulging']
                     else:
-                        color = colors['disk']  # По умолчанию диск
-                    
-                    # Создаем маску для этой метки
+                        color = colors['disk']
                     mask = (seg_slice == label_value)
                     if np.any(mask):
-                        if variation == 0:  # Только контуры
-                            from scipy.ndimage import binary_erosion
-                            eroded_mask = binary_erosion(mask, iterations=1)
-                            contour_mask = mask & ~eroded_mask
-                            for i in range(3):
-                                rgb_image[:, :, i][contour_mask] = color[i]
-                        elif variation == 1:  # Только заливка
+                        from scipy.ndimage import binary_erosion
+                        eroded_mask = binary_erosion(mask, iterations=1)
+                        contour_mask = mask & ~eroded_mask
+                        # --- Кастомная логика ---
+                        if label_value in [200, 201]:
+                            # Грыжа и выбухание — только заливка
                             for i in range(3):
                                 rgb_image[:, :, i][mask] = color[i]
-                        else:  # variation == 2: Контуры + заливка
-                            from scipy.ndimage import binary_erosion
-                            eroded_mask = binary_erosion(mask, iterations=1)
-                            contour_mask = mask & ~eroded_mask
-                            # Заливка с прозрачностью
-                            for i in range(3):
-                                rgb_image[:, :, i][mask] = (rgb_image[:, :, i][mask] * 0.7 + color[i] * 0.3).astype(np.uint8)
-                            # Контуры поверх
+                        else:
+                            # Остальные — только контур
                             for i in range(3):
                                 rgb_image[:, :, i][contour_mask] = color[i]
-                
-                # Конвертируем в PIL Image для добавления текста
+                # --- остальной код без изменений ---
                 pil_image = Image.fromarray(rgb_image)
                 draw = ImageDraw.Draw(pil_image)
-                
                 if show_labels:
-                    # Пытаемся загрузить шрифт, если не получится - используем стандартный
                     try:
-                        font_large = ImageFont.truetype("arial.ttf", 12)  # Для позвонков (уменьшено)
-                        font_small = ImageFont.truetype("arial.ttf", 10)  # Для остального
+                        font_large = ImageFont.truetype("arial.ttf", 12)
+                        font_small = ImageFont.truetype("arial.ttf", 10)
                     except:
                         font_large = ImageFont.load_default()
                         font_small = ImageFont.load_default()
-                    
-                    # Добавляем подписи для найденных позвонков
                     found_vertebrae = []
                     for label_value in np.unique(seg_slice):
                         if label_value in vertebra_descriptions:
-                            # Находим центр позвонка
                             mask = (seg_slice == label_value)
                             if np.any(mask):
                                 coords = np.argwhere(mask)
                                 center_y, center_x = coords.mean(axis=0).astype(int)
-                                # Добавляем подпись
                                 description = vertebra_descriptions[label_value]
                                 text_bbox = draw.textbbox((0, 0), description, font=font_large)
                                 text_width = text_bbox[2] - text_bbox[0]
@@ -1398,7 +1331,6 @@ def create_sagittal_bmp_images(nifti_img: Nifti1Image, nifti_seg: Nifti1Image, o
                                 draw.rectangle([text_x-2, text_y-2, text_x+text_width+2, text_y+text_height+2], fill=(0, 0, 0), outline=(255, 255, 255))
                                 draw.text((text_x, text_y), description, fill=(255, 255, 255), font=font_large)
                                 found_vertebrae.append(description)
-                    # --- Справочная информация в нижнем левом углу ---
                     axis_names = ['X', 'Y', 'Z']
                     slice_info = f"Slice {slice_idx+1}/{num_slices} ({axis_names[slice_axis]})"
                     variation_names = ['Контуры', 'Заливка', 'Контуры+Заливка']
@@ -1420,24 +1352,17 @@ def create_sagittal_bmp_images(nifti_img: Nifti1Image, nifti_seg: Nifti1Image, o
                         text_height = text_bbox[3] - text_bbox[1]
                         draw.rectangle([info_x-2, y-2, info_x+text_width+2, y+text_height+2], fill=(0,0,0), outline=None)
                         draw.text((info_x, y), line, fill=(255,255,255), font=font_small)
-                # Если show_labels == False, не рисуем подписи вообще
-                
-                # Сохраняем BMP
                 bmp_filename = f"sagittal_slice_{slice_idx+1:03d}.bmp"
                 bmp_path = bmp_dir / bmp_filename
                 pil_image.save(bmp_path, 'BMP')
-                
-                if logger and slice_idx % 10 == 0:  # Логируем каждые 10 срезов
+                if logger and slice_idx % 10 == 0:
                     logger.info(f"Сохранен срез {slice_idx+1}/{num_slices}: {bmp_filename}")
-                
             except Exception as e:
                 if logger:
                     logger.error(f"Ошибка при создании BMP для среза {slice_idx}: {e}")
                 continue
-        
         if logger:
             logger.info(f"Создано {num_slices} BMP изображений в папке {bmp_dir}")
-            
     except Exception as e:
         if logger:
             logger.error(f"Ошибка при создании BMP изображений: {e}")
@@ -1453,6 +1378,96 @@ def get_device():
         return torch.device('cpu')
 
 DEVICE = get_device()
+
+# --- Новый механизм определения грыжи/выбухания по проекции позвонков ---
+def get_adjacent_vertebrae_labels(disk_label):
+    """
+    Возвращает метки верхнего и нижнего позвонка для данного диска.
+    """
+    # Соответствие для стандартных дисков
+    disk_to_vertebra = {
+        63: (12, 13), 64: (13, 14), 65: (14, 15), 66: (15, 16), 67: (16, 17),
+        71: (17, 21), 72: (21, 22), 73: (22, 23), 74: (23, 24), 75: (24, 25),
+        76: (25, 26), 77: (26, 27), 78: (27, 28), 79: (28, 29), 80: (29, 30),
+        81: (30, 31), 82: (31, 32), 91: (32, 41), 92: (41, 42), 93: (42, 43),
+        94: (43, 44), 95: (44, 45), 96: (45, 50), 100: (50, 0)
+    }
+    return disk_to_vertebra.get(disk_label, (None, None))
+
+
+def detect_herniation_bulging_projection(rotated_mask: np.ndarray, disk_label: int, logger=None):
+    """
+    Новый механизм: вычитается только ближайшая к диску часть верхнего и нижнего позвонка (в пределах N вокселей).
+    Возвращает маску (грыжа/выбухание).
+    """
+    import nibabel as nib
+    import os
+    from scipy.ndimage import distance_transform_edt
+    disk_mask = (rotated_mask == disk_label).astype(bool)
+    upper_label, lower_label = get_adjacent_vertebrae_labels(disk_label)
+    if upper_label is None or lower_label is None:
+        if logger:
+            logger.warning(f"Диск {disk_label}: не удалось определить метки позвонков для проекции")
+        return np.zeros_like(disk_mask, dtype=bool)
+    N = 5  # радиус вокселей для "ближайшей части"
+    def get_near_disk_part(vertebra_mask):
+        if not np.any(vertebra_mask):
+            return np.zeros_like(vertebra_mask, dtype=bool)
+        # расстояние от каждого вокселя позвонка до ближайшего вокселя диска
+        dist_to_disk = distance_transform_edt(~disk_mask)
+        near_mask = (vertebra_mask & (dist_to_disk <= N))
+        return near_mask
+    upper_mask = (rotated_mask == upper_label).astype(bool)
+    lower_mask = (rotated_mask == lower_label).astype(bool)
+    # --- True-столбик между пластинами ---
+    vertebrae_proj_mask = np.zeros_like(disk_mask, dtype=bool)
+    if np.any(upper_mask) and np.any(lower_mask):
+        upper_coords = np.argwhere(upper_mask)
+        lower_coords = np.argwhere(lower_mask)
+        z_max = upper_coords[:, 2].max()
+        z_min = lower_coords[:, 2].min()
+        upper_plate = upper_coords[upper_coords[:, 2] == z_max]
+        lower_plate = lower_coords[lower_coords[:, 2] == z_min]
+        # Для быстрого поиска: set из (x, y)
+        upper_xy = set((x, y) for x, y, _ in upper_plate)
+        lower_xy = set((x, y) for x, y, _ in lower_plate)
+        common_xy = upper_xy & lower_xy
+        for x, y in common_xy:
+            z_start = min(z_max, z_min)
+            z_end = max(z_max, z_min)
+            vertebrae_proj_mask[x, y, z_start:z_end+1] = True
+    else:
+        vertebrae_proj_mask = upper_mask | lower_mask
+    protrusion_mask = (disk_mask & (~vertebrae_proj_mask)).astype(bool)
+    canal_mask = (rotated_mask == CANAL_LABEL).astype(bool)
+    if not np.any(canal_mask):
+        return protrusion_mask
+    disk_coords = np.argwhere(disk_mask)
+    canal_coords = np.argwhere(canal_mask)
+    if len(disk_coords) == 0 or len(canal_coords) == 0:
+        return protrusion_mask
+    disk_center = disk_coords.mean(axis=0)
+    canal_center = canal_coords.mean(axis=0)
+    direction_to_canal = canal_center - disk_center
+    direction_to_canal = direction_to_canal / (np.linalg.norm(direction_to_canal) + 1e-8)
+    if logger:
+        from utils.constant import VERTEBRA_DESCRIPTIONS
+        logger.info(f"Диск {disk_label} ({VERTEBRA_DESCRIPTIONS.get(disk_label, '?')}): disk_center={disk_center}, canal_center={canal_center}, direction_to_canal={direction_to_canal}")
+    mask_coords = np.argwhere(protrusion_mask)
+    keep_mask = np.zeros_like(protrusion_mask, dtype=bool)
+    for coord in mask_coords:
+        rel = coord - disk_center
+        if np.dot(rel, direction_to_canal) < 0:
+            keep_mask[tuple(coord)] = True
+    # --- Сохраняем промежуточные маски для теста ---
+    out_dir = 'debug_masks'
+    os.makedirs(out_dir, exist_ok=True)
+    affine = np.eye(4)
+    nib.save(nib.Nifti1Image(vertebrae_proj_mask.astype(np.uint8), affine), os.path.join(out_dir, f'vertebrae_proj_mask_{disk_label}.nii.gz'))
+    nib.save(nib.Nifti1Image(protrusion_mask.astype(np.uint8), affine), os.path.join(out_dir, f'protrusion_mask_{disk_label}.nii.gz'))
+    nib.save(nib.Nifti1Image(keep_mask.astype(np.uint8), affine), os.path.join(out_dir, f'keep_mask_{disk_label}.nii.gz'))
+    # ---
+    return keep_mask
 
 def main():
     """
@@ -1542,6 +1557,10 @@ def main():
         # Создаем и сохраняем глобальную сегментацию с грыжами
         try:
             global_seg_with_herniations = create_global_segmentation_with_herniations(nifti_seg, all_herniation_results, logger)
+
+            create_sagittal_bmp_images(mri_data_sag, global_seg_with_herniations.get_fdata(), output_dir, logger, slice_axis=0, variation=0,
+                                       show_labels=True)
+
             global_seg_path = output_dir / "seg_with_herniations.nii.gz"
             save(global_seg_with_herniations, str(global_seg_path))
             logger.info(f"Сохранена глобальная сегментация с грыжами: {global_seg_path}")
