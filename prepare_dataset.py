@@ -138,11 +138,8 @@ def reorient_canonical_sitk(image_sitk):
             image_nifti = nib.Nifti1Image(image_data.astype(image_data_dtype), affine)
 
     # 7. Приведение к канонической ориентации через nibabel
-    image_nifti_canonical = nib.as_closest_canonical(image_nifti)
-
-    # 8. Перевод обратно из nibabel -> numpy -> sitk
-    image_np_canonical = np.asanyarray(image_nifti_canonical.dataobj)
-    affine_canonical = image_nifti_canonical.affine
+    image_np_canonical = np.asanyarray(image_nifti.dataobj)
+    affine_canonical = image_nifti.affine
 
     # 9. Извлекаем новую геометрию для sitk
     new_spacing = np.linalg.norm(affine_canonical[:3, :3], axis=0)
@@ -159,58 +156,110 @@ def reorient_canonical_sitk(image_sitk):
 
 def main():
     gradings = pd.read_csv(GRADINGS_CSV)
-    for img_name in tqdm(os.listdir(IMAGES_DIR)):
-        if not img_name.endswith('.mha'):
+    # Собираем список всех patient_id
+    all_img_names = [f for f in os.listdir(IMAGES_DIR) if f.endswith('.mha')]
+    patient_ids = set([name.split('_')[0] for name in all_img_names])
+    for patient_id in tqdm(sorted(patient_ids)):
+        # Собираем пути к каналам
+        channel_files = {'t1': None, 't2': None, 't2_SPACE': None}
+        for ch in channel_files.keys():
+            fname = f'{patient_id}_{ch}.mha'
+            fpath = os.path.join(IMAGES_DIR, fname)
+            if os.path.exists(fpath):
+                channel_files[ch] = fpath
+        # Сегментация (берём по t1, t2 или t2_SPACE — что есть)
+        mask_path = None
+        for ch in ['t1', 't2', 't2_SPACE']:
+            fname = f'{patient_id}_{ch}.mha'
+            mpath = os.path.join(MASKS_DIR, fname)
+            if os.path.exists(mpath):
+                mask_path = mpath
+                break
+        if mask_path is None:
             continue
-        patient_id = img_name.split('_')[0]
-        img_path = os.path.join(IMAGES_DIR, img_name)
-        mask_path = os.path.join(MASKS_DIR, img_name)
-        if not os.path.exists(mask_path):
-            continue
-        # img_itk = reorient_canonical_sitk(sitk.ReadImage(img_path))
-        # mask_itk = reorient_canonical_sitk(sitk.ReadImage(mask_path))
-
-        img_itk = sitk.ReadImage(img_path)
+        # Читаем маску
         mask_itk = sitk.ReadImage(mask_path)
-
-        img_itk = resample_to_spacing(img_itk, new_spacing=(1.0, 1.0, 1.0), is_mask=False)
         mask_itk = resample_to_spacing(mask_itk, new_spacing=(1.0, 1.0, 1.0), is_mask=True)
-        img = sitk.GetArrayFromImage(img_itk)
         mask = sitk.GetArrayFromImage(mask_itk)
-
         for disk_label in range(201, 250):
             disk_mask = (mask == disk_label)
             if not np.any(disk_mask):
                 continue
             coords = np.argwhere(disk_mask)
-            # PCA только по центральной части диска
             R, mean = get_pca_transform_central(coords, central_percent=0.6)
-            img_rot, mask_rot = apply_affine_to_image_and_mask(img, mask, R, mean)
-            # bounding box только по текущему диску
-            disk_mask_rot = (mask_rot == disk_label)
-            bbox_disk = get_bounding_box(disk_mask_rot)
-            if bbox_disk is None:
+            # --- Жёсткая фиксация направления осей ---
+            vertebra_up_coords = np.argwhere(mask == (disk_label - 200))
+            vertebra_down_coords = np.argwhere(mask == (disk_label - 199))
+            if vertebra_up_coords.size > 0 and vertebra_down_coords.size > 0:
+                z_up = vertebra_up_coords[:, 0].mean()
+                z_down = vertebra_down_coords[:, 0].mean()
+                if z_down < z_up:
+                    R[2, :] *= -1  # Инвертируем ось Z (нижний всегда ниже)
+            canal_coords = np.argwhere(mask == 2)
+            disk_coords = np.argwhere(mask == disk_label)
+            if canal_coords.size > 0 and disk_coords.size > 0:
+                x_canal = canal_coords[:, 2].mean()
+                x_disk = disk_coords[:, 2].mean()
+                if x_canal < x_disk:
+                    R[0, :] *= -1  # Инвертируем ось X (канал всегда справа)
+            # ---
+            # Для каждого канала: читаем, ресемплим, вращаем, crop
+            img_channels = []
+            shape_ref = None
+            bbox_disk = None
+            for ch in ['t1', 't2', 't2_SPACE']:
+                img_path = channel_files[ch]
+                if img_path is not None:
+                    img_itk = sitk.ReadImage(img_path)
+                    img_itk = resample_to_spacing(img_itk, new_spacing=(1.0, 1.0, 1.0), is_mask=False)
+                    img = sitk.GetArrayFromImage(img_itk)
+                    img_rot, _ = apply_affine_to_image_and_mask(img, mask, R, mean)
+                    if bbox_disk is None:
+                        disk_mask_rot = (mask == disk_label)
+                        bbox_disk = get_bounding_box(disk_mask_rot)
+                    img_crop = crop_with_bbox(img_rot, bbox_disk)
+                    if shape_ref is None:
+                        shape_ref = img_crop.shape
+                    else:
+                        # Приводим к shape_ref (pad/crop)
+                        pad = [(0, max(0, shape_ref[d] - img_crop.shape[d])) for d in range(3)]
+                        img_crop = np.pad(img_crop, pad, mode='constant')
+                        img_crop = img_crop[tuple(slice(0, shape_ref[d]) for d in range(3))]
+                    img_channels.append(img_crop)
+                else:
+                    # Нет канала — заполняем нулями
+                    if shape_ref is None:
+                        # Нужно shape_ref — пропускаем, обработаем после первого канала
+                        img_channels.append(None)
+                    else:
+                        img_channels.append(np.zeros(shape_ref, dtype=np.float32))
+            # Если shape_ref появился только после первого канала, заполняем пропущенные
+            if shape_ref is None:
+                # Не удалось определить форму — пропускаем этот диск
                 continue
-            # Половины позвонков
-            vertebra_up_mask_rot = (mask_rot == (disk_label - 200))
-            vertebra_down_mask_rot = (mask_rot == (disk_label - 199))
-            bbox_up_half = get_half_bounding_box(vertebra_up_mask_rot, half='lower', axis=0)
-            bbox_down_half = get_half_bounding_box(vertebra_down_mask_rot, half='upper', axis=0)
-            # Собираем итоговый bbox
-            bboxes = [bbox for bbox in [bbox_up_half, bbox_disk, bbox_down_half] if bbox is not None]
-            minc = np.min([b[0] for b in bboxes], axis=0)
-            maxc = np.max([b[1] for b in bboxes], axis=0)
-            bbox_total = (minc, maxc)
-            img_crop = crop_with_bbox(img_rot, bbox_total)
-            mask_crop = crop_with_bbox(mask_rot, bbox_total)
+            for i in range(3):
+                if img_channels[i] is None:
+                    img_channels[i] = np.zeros(shape_ref, dtype=np.float32)
+            # Собираем channels-first
+            img_3ch = np.stack(img_channels, axis=0)
+            # Аналогично crop для маски
+            mask_rot = apply_affine_to_image_and_mask(mask, mask, R, mean, is_mask=True)[1]
+            mask_crop = crop_with_bbox(mask_rot, bbox_disk)
             out_img_path = os.path.join(OUTPUT_DIR, f'{patient_id}_disk{disk_label}_img.nii.gz')
             out_mask_path = os.path.join(OUTPUT_DIR, f'{patient_id}_disk{disk_label}_mask.nii.gz')
-            img_crop_itk = sitk.GetImageFromArray(img_crop)
+            img_crop_itk = sitk.GetImageFromArray(img_3ch)
             mask_crop_itk = sitk.GetImageFromArray(mask_crop)
             img_crop_itk.SetSpacing((1.0, 1.0, 1.0))
             mask_crop_itk.SetSpacing((1.0, 1.0, 1.0))
             sitk.WriteImage(img_crop_itk, out_img_path)
             sitk.WriteImage(mask_crop_itk, out_mask_path)
+            # --- Сохраняем первый канал отдельно для теста ---
+            first_channel = img_3ch[0]
+            out_first_channel_path = os.path.join(OUTPUT_DIR, f'{patient_id}_disk{disk_label}_img_first_channel.nii.gz')
+            first_channel_itk = sitk.GetImageFromArray(first_channel)
+            first_channel_itk.SetSpacing((1.0, 1.0, 1.0))
+            sitk.WriteImage(first_channel_itk, out_first_channel_path)
+            # ---
             grading_row = gradings[(gradings['Patient'] == int(patient_id)) & (gradings['IVD label'] == (disk_label - 200))]
             if not grading_row.empty:
                 grading_row.to_csv(os.path.join(OUTPUT_DIR, f'{patient_id}_disk{disk_label}_grading.csv'), index=False)

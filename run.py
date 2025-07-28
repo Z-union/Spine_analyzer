@@ -774,7 +774,7 @@ def parse_args():
         '''),
         formatter_class=argparse.RawTextHelpFormatter
     )
-    parser.add_argument('--studies_folder', type=Path, help='The input DICOM folder containing the sagittal images.', default=Path(r'F:\WorkSpace\Z-Union\100 МРТ ПК\Абрамян Соня Самвеловна\DICOM\PA000000\ST000000'))
+    parser.add_argument('--studies_folder', type=Path, help='The input DICOM folder containing the sagittal images.', default=Path(r'F:\WorkSpace\Z-Union\100 МРТ ПК\Грозов Михаил Александрович\DICOM\PA000000'))
     parser.add_argument('--output', type=Path, help='The output folder where the segmentation results will be saved.', default=Path(r'./results'))
     return parser.parse_args()
 
