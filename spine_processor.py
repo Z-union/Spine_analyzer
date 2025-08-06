@@ -46,8 +46,9 @@ def initialize_models(
     ax_model_path: str = 'model/weights/ax.pth',
     sag_step_1_model_path: str = 'model/weights/sag_step_1.pth',
     sag_step_2_model_path: str = 'model/weights/sag_step_2.pth',
-    grading_model_path: str = 'model/weights/grading.pth'
-) -> Tuple[torch.nn.Module, torch.nn.Module, torch.nn.Module, torch.nn.Module]:
+    grading_model_path: str = 'model/weights/grading.pth',
+    use_dual_channel_grading: bool = True
+) -> Tuple[torch.nn.Module, torch.nn.Module, torch.nn.Module, object]:
     """
     Инициализирует все модели для обработки позвоночника.
     
@@ -56,25 +57,38 @@ def initialize_models(
         sag_step_1_model_path: Путь к модели для первого шага сагиттальной сегментации
         sag_step_2_model_path: Путь к модели для второго шага сагиттальной сегментации
         grading_model_path: Путь к модели для grading
+        use_dual_channel_grading: Использовать двухканальную модель grading
         
     Returns:
-        Кортеж из четырех загруженных моделей
+        Кортеж из трех моделей сегментации и grading процессора
     """
     device = get_device()
     
-    # Загружаем модели
+    # Загружаем модели сегментации
     ax_model = torch.load(ax_model_path, map_location=device, weights_only=False)
     sag_step_1_model = torch.load(sag_step_1_model_path, map_location=device, weights_only=False)
     sag_step_2_model = torch.load(sag_step_2_model_path, map_location=device, weights_only=False)
-    grading_model = torch.load(grading_model_path, map_location=device, weights_only=False)
     
-    # Переводим модели в режим оценки
+    # Создаем grading процессор
+    try:
+        from grading_processor import SpineGradingProcessor
+        grading_processor = SpineGradingProcessor(
+            model_path=grading_model_path,
+            device=str(device),
+            use_dual_channel=use_dual_channel_grading
+        )
+        print(f"Инициализирован grading процессор (двухканальный: {use_dual_channel_grading})")
+    except Exception as e:
+        print(f"Ошибка при инициализации grading процессора: {e}")
+        print("Используется заглушка")
+        grading_processor = None
+    
+    # Переводим модели сегментации в режим оценки
     ax_model.eval()
     sag_step_1_model.eval()
     sag_step_2_model.eval()
-    grading_model.eval()
     
-    return ax_model, sag_step_1_model, sag_step_2_model, grading_model
+    return ax_model, sag_step_1_model, sag_step_2_model, grading_processor
 
 
 def get_study_from_folder(study_folder: str) -> List[pydicom.dataset.FileDataset]:
@@ -202,7 +216,7 @@ def run_segmentation(
             if logger:
                 logger.info("Выбран сагиттальный скан для сегментации.")
             
-            save(sag_scan, 'sagittal_original.nii.gz')
+            # save(sag_scan, 'sagittal_original.nii.gz')
             nifti_img = Nifti1Image(sag_scan.get_fdata()[np.newaxis, ...], sag_scan.affine, sag_scan.header)
             
             # Двухэтапная сегментация
@@ -276,18 +290,18 @@ def run_segmentation(
                     multi_channel = np.stack([img_data, seg_data], axis=0)
                     nifti_img = Nifti1Image(multi_channel, nifti_img.affine, nifti_img.header)
             
-            save(nifti_img, 'sagittal_processed.nii.gz')
-            save(nifti_seg, 'sagittal_segmentation.nii.gz')
-            
-            if logger:
-                logger.info("Обработанные сагиттальные файлы сохранены: sagittal_processed.nii.gz, sagittal_segmentation.nii.gz")
+            # save(nifti_img, 'sagittal_processed.nii.gz')
+            # save(nifti_seg, 'sagittal_segmentation.nii.gz')
+            #
+            # if logger:
+            #     logger.info("Обработанные сагиттальные файлы сохранены: sagittal_processed.nii.gz, sagittal_segmentation.nii.gz")
         
         # Сегментация аксиала, если есть
         if ax_scan is not None:
             if logger:
                 logger.info("Выбран аксиальный скан для сегментации.")
             
-            save(ax_scan, 'axial_original.nii.gz')
+            # save(ax_scan, 'axial_original.nii.gz')
             axial = Nifti1Image(ax_scan.get_fdata()[np.newaxis, ...], ax_scan.affine, ax_scan.header)
             
             data, seg, properties = preprocessor.run_case(axial, transpose_forward=[0, 1, 2])
@@ -312,11 +326,11 @@ def run_segmentation(
             processed_axial = Nifti1Image(processed_axial_data, ax_scan.affine, ax_scan.header)
             ax_seg_nifti = Nifti1Image(np.asanyarray(seg_nifti.dataobj), ax_scan.affine, ax_scan.header)
             
-            save(processed_axial, 'axial_processed.nii.gz')
-            save(ax_seg_nifti, 'axial_segmentation.nii.gz')
-            
-            if logger:
-                logger.info("Обработанные аксиальные файлы сохранены: axial_processed.nii.gz, axial_segmentation.nii.gz")
+            # save(processed_axial, 'axial_processed.nii.gz')
+            # save(ax_seg_nifti, 'axial_segmentation.nii.gz')
+            #
+            # if logger:
+            #     logger.info("Обработанные аксиальные файлы сохранены: axial_processed.nii.gz, axial_segmentation.nii.gz")
             
             processed_axial = Nifti1Image(np.squeeze(processed_axial.get_fdata()), processed_axial.affine, processed_axial.header)
             ax_seg_nifti = transform_seg2image(processed_axial, ax_seg_nifti)
@@ -343,7 +357,7 @@ def process_study(
     ax_model: torch.nn.Module,
     sag_step_1_model: torch.nn.Module,
     sag_step_2_model: torch.nn.Module,
-    grading_model: torch.nn.Module,
+    grading_processor: object,
     logger: Optional[logging.Logger] = None
 ) -> Dict:
     """
@@ -354,11 +368,11 @@ def process_study(
         ax_model: Модель для аксиальной сегментации
         sag_step_1_model: Модель для первого шага сагиттальной сегментации
         sag_step_2_model: Модель для второго шага сагиттальной сегментации
-        grading_model: Модель для grading
+        grading_processor: Процессор для grading анализа
         logger: Logger для записи сообщений
         
     Returns:
-        Словарь с результатами обработки
+        Слова��ь с результатами обработки
     """
     start_time = time.time()
     
@@ -383,37 +397,36 @@ def process_study(
         if logger:
             logger.info(f"Найдены диски: {present_disks}")
         
-        # Обрабатываем каждый диск с помощью grading модели
-        results = {}
-        device = get_device()
-        grading_model.to(device)
-        
         # Получаем данные изображения
         if hasattr(nifti_img, 'get_fdata'):
-            if nifti_img.get_fdata().ndim == 4:
-                # Берем второй канал (индекс 1) для grading
-                mri_data = nifti_img.get_fdata()[1]
-            else:
-                mri_data = nifti_img.get_fdata()
+            mri_data = nifti_img.get_fdata()
         else:
             mri_data = np.asarray(nifti_img)
         
         mask_data = nifti_seg.get_fdata()
         
-        for disk_label in present_disks:
+        # Обрабатываем диски с помощью grading процессора
+        if grading_processor is not None:
+            if logger:
+                logger.info("Запускаем grading анализ дисков...")
+            
             try:
+                disk_results = grading_processor.process_disks(mri_data, mask_data, present_disks)
+                grading_summary = grading_processor.create_summary(disk_results)
+                
                 if logger:
-                    logger.info(f"Обрабатываем диск {disk_label} ({VERTEBRA_DESCRIPTIONS.get(disk_label, 'Unknown')})")
-                
-                # Здесь должна быть логика обработки отдельного диска
-                # Пока возвращаем заглушку
-                disk_result = process_single_disk(mri_data, mask_data, disk_label, grading_model, logger)
-                results[disk_label] = disk_result
-                
+                    logger.info(f"Grading анализ завершен. Обработано дисков: {len(disk_results)}")
+                    
             except Exception as e:
                 if logger:
-                    logger.error(f"Ошибка при обработке диска {disk_label}: {e}")
-                results[disk_label] = {"error": str(e)}
+                    logger.error(f"Ошибка при grading анализе: {e}")
+                disk_results = {disk_label: {"error": str(e)} for disk_label in present_disks}
+                grading_summary = {"error": "Grading analysis failed"}
+        else:
+            if logger:
+                logger.warning("Grading процессор не инициализирован, используется заглушка")
+            disk_results = {disk_label: {"error": "Grading processor not available"} for disk_label in present_disks}
+            grading_summary = {"error": "Grading processor not available"}
         
         elapsed_time = time.time() - start_time
         
@@ -422,10 +435,12 @@ def process_study(
         
         return {
             "processing_time": elapsed_time,
-            "processed_disks": len(results),
-            "disk_results": results,
+            "processed_disks": len(disk_results),
+            "disk_results": disk_results,
+            "grading_summary": grading_summary,
             "segmentation_shape": seg_data.shape,
-            "unique_labels": unique_labels.tolist()
+            "unique_labels": unique_labels.tolist(),
+            "present_disks": present_disks
         }
         
     except Exception as e:
@@ -443,13 +458,13 @@ def process_single_disk(
     logger: Optional[logging.Logger] = None
 ) -> Dict:
     """
-    Обрабатывает отдельный диск для grading.
+    Обрабатывает отдельный диск для grading с поддержкой двухканального входа.
     
     Args:
         mri_data: Данные МРТ изображения
         mask_data: Данные сегментации
         disk_label: Метка диска
-        grading_model: Мо��ель для grading
+        grading_model: Модель для grading
         logger: Logger для записи сообщений
         
     Returns:
@@ -482,13 +497,38 @@ def process_single_disk(
         cropped_mri = mri_data[tuple(crop_slices)]
         cropped_mask = mask_data[tuple(crop_slices)]
         
-        # Нормализация
+        # Нормализация изображения
         mean = cropped_mri.mean()
         std = cropped_mri.std() if cropped_mri.std() > 0 else 1.0
         normalized_mri = (cropped_mri - mean) / std
         
-        # Подготавливаем для модели
-        img_tensor = torch.tensor(normalized_mri).unsqueeze(0).unsqueeze(0).float().to(device)
+        # Нормализация маски диска (приведение к 0-1)
+        disk_mask_cropped = (cropped_mask == disk_label).astype(np.float32)
+        if disk_mask_cropped.max() > 1:
+            disk_mask_cropped = disk_mask_cropped / disk_mask_cropped.max()
+        
+        # Проверяем, поддерживает ли модель двухканальный вход
+        try:
+            # Пытаемся определить количество входных каналов модели
+            if hasattr(grading_model, 'conv1'):
+                input_channels = grading_model.conv1.in_channels
+            else:
+                input_channels = 1  # По умолчанию одноканальная
+        except:
+            input_channels = 1
+        
+        # Подготавливаем тензор для модели
+        if input_channels == 2:
+            # Двухканальный вход: [изображение, маска диска]
+            dual_channel = np.stack([normalized_mri, disk_mask_cropped], axis=0)
+            img_tensor = torch.tensor(dual_channel).unsqueeze(0).float().to(device)
+            if logger:
+                logger.debug(f"Используется двухканальный вход для диска {disk_label}")
+        else:
+            # Одноканальный вход: только изображение
+            img_tensor = torch.tensor(normalized_mri).unsqueeze(0).unsqueeze(0).float().to(device)
+            if logger:
+                logger.debug(f"Используется одноканальный вход для диска {disk_label}")
         
         # Предсказание
         with torch.no_grad():
@@ -507,7 +547,9 @@ def process_single_disk(
             "bulging": predictions[IDX_BULGE] if len(predictions) > IDX_BULGE else 0,
             "pfirrman": predictions[IDX_PFIRRMAN] if len(predictions) > IDX_PFIRRMAN else 0,
             "crop_shape": cropped_mri.shape,
-            "disk_voxels": int(np.sum(disk_mask))
+            "disk_voxels": int(np.sum(disk_mask)),
+            "input_channels": input_channels,
+            "model_type": "dual_channel" if input_channels == 2 else "single_channel"
         }
         
         if logger:
