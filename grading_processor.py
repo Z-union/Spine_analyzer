@@ -10,9 +10,11 @@ import cv2
 import logging
 from typing import Dict, List, Tuple, Optional, Union
 from pathlib import Path
+from model.garding import MultiHeadSpineModel
+from grading_pipeline import SpineGradingPipeline
 
 # Импорт констант из основного проекта
-from utils.constant import VERTEBRA_DESCRIPTIONS, LANDMARK_LABELS
+from utils.constant import VERTEBRA_DESCRIPTIONS, LANDMARK_LABELS, CANAL_LABEL
 
 # Импорт модели
 try:
@@ -60,8 +62,8 @@ class SpineGradingProcessor:
         
         # Категории патологий
         self.categories = [
-            'ModicChanges', 'UpperEndplateDefect', 'LowerEndplateDefect',
-            'Spondylolisthesis', 'Herniation', 'Narrowing', 'Bulging', 'Pfirrmann'
+            'Modic', 'UP endplate', 'LOW endplate',
+            'Spondylolisthesis', 'Disc herniation', 'Disc narrowing', 'Disc bulging', 'Pfirrmann grade'
         ]
         
         # Описания категорий
@@ -76,6 +78,15 @@ class SpineGradingProcessor:
             'Pfirrmann': 'Дегенерация по Pfirrmann (0-4)'
         }
         
+        # Инициализируем пайплайн нарезки патчей так же, как в grading_dataset/run.py
+        # Используем фиксированный размер патча (32, 112, 32) и отключаем выравнивание при нарезке
+        try:
+            self.slice_pipeline = SpineGradingPipeline(patch_size=(32, 112, 32), batch_size=4)
+            logger.info("Инициализирован внутренний пайплайн нарезки (grading_pipeline) для инференса")
+        except Exception as e:
+            self.slice_pipeline = None
+            logger.warning(f"��е удалось инициализировать grading_pipeline для нарезки: {e}")
+        
         logger.info("Grading processor инициализирован")
     
     def _load_model(self) -> torch.nn.Module:
@@ -86,9 +97,10 @@ class SpineGradingProcessor:
         if self.use_dual_channel and DUAL_CHANNEL_AVAILABLE:
             # Используем двухканальную модель
             try:
-                # Пробуем загрузить с weights_only=False
-                checkpoint = torch.load(str(self.model_path), map_location=self.device, weights_only=False)
-                model = create_dual_channel_model(str(self.model_path), num_input_channels=2)
+                model = MultiHeadSpineModel(input_channels=2, dropout_p=0.3, depth=8, max_channels=256)
+                model.load_state_dict(torch.load(self.model_path, weights_only=True))
+                model.to(self.device)
+                model.eval()
                 logger.info(f"Загружена двухканальная модель grading из {self.model_path}")
             except Exception as e:
                 logger.warning(f"Ошибка загрузки двухканальной модели: {e}")
@@ -107,7 +119,7 @@ class SpineGradingProcessor:
         return model
     
     def process_disks(self, 
-                     mri_data: np.ndarray, 
+                     mri_data: List[np.ndarray],
                      mask_data: np.ndarray,
                      present_disks: List[int]) -> Dict[int, Dict]:
         """
@@ -123,53 +135,140 @@ class SpineGradingProcessor:
         """
         results = {}
         
-        logger.info(f"Входные данные МРТ: shape={mri_data.shape}, dtype={mri_data.dtype}")
+        logger.info(f"Входные данные МРТ: shape={mri_data[0].shape}, dtype={mri_data[0].dtype}")
         logger.info(f"Входные данные маски: shape={mask_data.shape}, dtype={mask_data.dtype}")
+
+        # Многоканальные данные - используем первые два канала как T1 и T2
+        t1_data = mri_data[0]
+        t2_data = mri_data[1]
+
         
-        # Проверяем, есть ли двухканальные данные
-        if mri_data.ndim == 4 and mri_data.shape[0] >= 2:
-            # Многоканальные данные - используем первые два канала как T1 и T2
-            t1_data = mri_data[0]
-            t2_data = mri_data[1] if mri_data.shape[0] > 1 else mri_data[0]
-            has_dual_channel_data = True
-            logger.info(f"Обнаружены многоканальные данные МРТ: {mri_data.shape}")
-            logger.info(f"T1 shape: {t1_data.shape}, T2 shape: {t2_data.shape}")
-        else:
-            # Одноканальные данные
-            if mri_data.ndim == 4:
-                t1_data = mri_data[0]
-            else:
-                t1_data = mri_data
-            t2_data = t1_data  # Дублируем канал для двухканальной модели
-            has_dual_channel_data = False
-            logger.info(f"Обнаружены одноканальные данные МРТ: {mri_data.shape}")
-            logger.info(f"T1 shape: {t1_data.shape}, T2 shape (дублированный): {t2_data.shape}")
-        
-        for disk_label in present_disks:
+        if self.use_dual_channel:
+            # Единая нарезка патчей через grading_pipeline (is_align=False) и инференс по патчам
             try:
-                logger.info(f"Обрабатываем диск {disk_label} ({self.disc_labels_map.get(disk_label, 'Unknown')})")
-                
-                if self.use_dual_channel:
-                    # Всегда используем двухканальную обработку если модель двухканальная
-                    logger.info(f"Используем двухканальную обработку для диска {disk_label}")
-                    disk_result = self._process_single_disk_dual_channel(
-                        t1_data, t2_data, mask_data, disk_label
-                    )
-                else:
-                    # Одноканальная обработка
+                if self.slice_pipeline is None:
+                    raise RuntimeError("slice_pipeline не инициализирован")
+
+                # Готовим многоканальные данные (C, D, H, W)
+                mri_2ch = np.stack([t1_data, t2_data], axis=0)
+                logger.info(f"Обнаружены многоканальные данные МРТ: {mri_2ch.shape}")
+                logger.info(f"T1 shape: {t1_data.shape}, T2 shape: {t2_data.shape}")
+
+                mri_2ch = np.rot90(np.transpose(mri_2ch, (0, 3, 2, 1)), k=2, axes=(1, 2))
+                mask_data = np.rot90(np.transpose(mask_data, (2, 1, 0)), k=2, axes=(0, 1))
+                # Строим seg_dict по текущей кодировке проекта
+                # Диски: только присутствующие уровни
+                disc_mask = np.where(np.isin(mask_data, present_disks), mask_data, 0).astype(np.uint16)
+                # Позвонки: эвристика — метки 11..50 (исключая канал/спинной мозг)
+                vertebra_mask = np.where(((mask_data >= 11) & (mask_data <= 50)), mask_data, 0).astype(np.uint16)
+                # Канал: CANAL_LABEL (обычно 2)
+                canal_mask = np.where(mask_data == CANAL_LABEL, CANAL_LABEL, 0).astype(np.uint8)
+
+                seg_dict = {
+                    "disc": disc_mask,
+                    "vertebra": vertebra_mask,
+                    "canal": canal_mask,
+                    "full": mask_data.astype(mask_data.dtype)
+                }
+
+                patches_mri, patches_seg, flags, codes = self.slice_pipeline.slice_patches_with_alignment(
+                    mri_2ch, seg_dict, is_align=False
+                )
+
+                logger.info(f"Нарезано патчей: {len(patches_mri)} (для дисков: {present_disks})")
+
+                for i, patch in enumerate(patches_mri):
+                    try:
+                        disc_id = int(codes[i].get("disc_id", 0)) if i < len(codes) else 0
+                        if i == 0 or disc_id not in present_disks:
+                            continue
+
+                        t1_processed = self._process_single_channel(patch[0])
+                        t2_processed = self._process_single_channel(patch[1])
+                        if t1_processed is None or t2_processed is None:
+                            results[disc_id] = {"error": "Failed to process patch"}
+                            continue
+
+                        prepared_volume = np.stack([t1_processed, t2_processed], axis=0)
+                        predictions = self._predict_dual_channel(prepared_volume)
+                        
+                        # Визуализация патча и результатов в results/patch_vis
+                        try:
+                            save_dir = Path('results') / 'patch_vis'
+                            save_dir.mkdir(parents=True, exist_ok=True)
+                            save_path = save_dir / f"disc_{disc_id}_patch_{i}.png"
+                            self.slice_pipeline.visualize_patch_with_results(
+                                patch_mri=patch,
+                                patch_seg=patches_seg[i],
+                                flag_valid=flags[i],
+                                result=predictions,
+                                save_path=str(save_path)
+                            )
+                            logger.info(f"Сохранена визуализация патча: {save_path}")
+                        except Exception as vis_e:
+                            logger.error(f"Ошибка визуализации патча disc_id={disc_id}, i={i}: {vis_e}")
+
+                        # Глобальные bbox/центр из исходной маски
+                        coords = np.argwhere(mask_data == disc_id)
+                        if coords.size > 0:
+                            min_coords = coords.min(axis=0)
+                            max_coords = coords.max(axis=0)
+                            center = coords.mean(axis=0).astype(int)
+                            bounds = (min_coords.tolist(), max_coords.tolist())
+                            center_list = center.tolist()
+                        else:
+                            bounds = (None, None)
+                            center_list = None
+
+                        level_name = self.disc_labels_map.get(disc_id, f"DISC_{disc_id}")
+                        result = {
+                            'disc_label': int(disc_id),
+                            'level_name': level_name,
+                            'center': center_list,
+                            'bounds': bounds,
+                            'predictions': predictions,
+                            'confidence_scores': self._calculate_confidence(predictions),
+                            'crop_shape': tuple(patch.shape[1:]),  # (D, H, W)
+                            'disk_voxels': int(np.sum(mask_data == disc_id)),
+                            'model_type': 'dual_channel'
+                        }
+                        results[disc_id] = result
+                    except Exception as e:
+                        logger.error(f"Ошибка при обработке патча #{i} (disc_id={codes[i].get('disc_id', 'N/A') if i < len(codes) else 'N/A'}): {e}")
+                        import traceback
+                        logger.error(f"Traceback: {traceback.format_exc()}")
+                        # Не перезаписываем существующий результат, если уже есть
+                        key = int(codes[i].get('disc_id', 0)) if i < len(codes) and 'disc_id' in codes[i] else None
+                        if key is not None:
+                            results[key] = {"error": str(e)}
+
+            except Exception as e:
+                logger.error(f"Ошибка при нарезке/инференсе через grading_pipeline: {e}")
+                import traceback
+                logger.error(f"Traceback: {traceback.format_exc()}")
+                # Fallback: поштучная обработка как раньше
+                for disk_label in present_disks:
+                    try:
+                        disk_result = self._process_single_disk_dual_channel(t1_data, t2_data, mask_data, disk_label)
+                        results[disk_label] = disk_result
+                    except Exception as ee:
+                        logger.error(f"Ошибка при fallback обработке диска {disk_label}: {ee}")
+                        results[disk_label] = {"error": str(ee)}
+        else:
+            # Одноканальный режим — оставляем поштучную обработку
+            for disk_label in present_disks:
+                try:
                     logger.info(f"Используем одноканальную обработку для диска {disk_label}")
                     disk_result = self._process_single_disk_single_channel(
                         t1_data, mask_data, disk_label
                     )
-                
-                results[disk_label] = disk_result
-                
-            except Exception as e:
-                logger.error(f"Ошибка при обработке диска {disk_label}: {e}")
-                import traceback
-                logger.error(f"Traceback: {traceback.format_exc()}")
-                results[disk_label] = {"error": str(e)}
-        
+                    results[disk_label] = disk_result
+                except Exception as e:
+                    logger.error(f"Ошибка при обработке диска {disk_label}: {e}")
+                    import traceback
+                    logger.error(f"Traceback: {traceback.format_exc()}")
+                    results[disk_label] = {"error": str(e)}
+
         return results
     
     def _process_single_disk_dual_channel(self, 
@@ -379,81 +478,85 @@ class SpineGradingProcessor:
         """
         try:
             logger.info(f"Обработка канала: входной размер {volume.shape}")
+
+            mean = volume.mean()
+            std = volume.std()
+            volume = (volume - mean) / std if std > 0 else (volume - mean)
             
-            # Нормализация
-            volume = volume.astype(np.float32)
-            vb_pair_median = np.median(volume[volume > 0]) if np.any(volume > 0) else 1.0
-            norm_med = 0.5
-            
-            volume = volume / vb_pair_median * norm_med
-            volume[volume < 0] = 0
-            volume[volume > 2.0] = 2.0
-            volume /= 2.0
+            # # Нормализация
+            # volume = volume.astype(np.float32)
+            # vb_pair_median = np.median(volume[volume > 0]) if np.any(volume > 0) else 1.0
+            # norm_med = 0.5
+            #
+            # volume = volume / vb_pair_median * norm_med
+            # volume[volume < 0] = 0
+            # volume[volume > 2.0] = 2.0
+            # volume /= 2.0
             
             logger.info(f"После нормализации: {volume.shape}, min={volume.min()}, max={volume.max()}")
             
-            # Взять центральные срезы
-            depth = volume.shape[2]
-            if depth >= 15:
-                center = depth // 2
-                start = center - 7
-                end = center + 8
-                volume = volume[:, :, start:end]
-            else:
-                pad_before = (15 - depth) // 2
-                pad_after = 15 - depth - pad_before
-                volume = np.pad(volume, ((0, 0), (0, 0), (pad_before, pad_after)), 
-                              mode='constant', constant_values=0)
+            # # Взять центральные срезы
+            # depth = volume.shape[2]
+            # if depth >= 15:
+            #     center = depth // 2
+            #     start = center - 7
+            #     end = center + 8
+            #     volume = volume[:, :, start:end]
+            # else:
+            #     pad_before = (15 - depth) // 2
+            #     pad_after = 15 - depth - pad_before
+            #     volume = np.pad(volume, ((0, 0), (0, 0), (pad_before, pad_after)),
+            #                   mode='constant', constant_values=0)
+            #
+            # logger.info(f"После обработки срезов: {volume.shape}")
             
-            logger.info(f"После обработки срезов: {volume.shape}")
+            # # Ресайз
+            # target_size = (192, 320)
+            # resized_slices = []
+            #
+            # for i in range(volume.shape[2]):
+            #     slice_2d = volume[:, :, i]
+            #     current_h, current_w = slice_2d.shape
+            #
+            #     # Обрезка/дополнение по высоте
+            #     if current_h > target_size[0]:
+            #         start_h = (current_h - target_size[0]) // 2
+            #         slice_2d = slice_2d[start_h:start_h + target_size[0], :]
+            #     elif current_h < target_size[0]:
+            #         pad_h = (target_size[0] - current_h) // 2
+            #         slice_2d = np.pad(slice_2d, ((pad_h, target_size[0] - current_h - pad_h), (0, 0)),
+            #                         mode='constant', constant_values=0)
+            #
+            #     # Обрезка/дополнение по ширине
+            #     if current_w > target_size[1]:
+            #         start_w = (current_w - target_size[1]) // 2
+            #         slice_2d = slice_2d[:, start_w:start_w + target_size[1]]
+            #     elif current_w < target_size[1]:
+            #         pad_w = (target_size[1] - current_w) // 2
+            #         slice_2d = np.pad(slice_2d, ((0, 0), (pad_w, target_size[1] - current_w - pad_w)),
+            #                         mode='constant', constant_values=0)
+            #
+            #     if slice_2d.shape != target_size:
+            #         slice_2d = cv2.resize(slice_2d, (target_size[1], target_size[0]),
+            #                             interpolation=cv2.INTER_CUBIC)
+            #
+            #     resized_slices.append(slice_2d)
+            #
+            # volume = np.stack(resized_slices, axis=2)
+            # logger.info(f"После ресайза: {volume.shape}")
+            #
+            # # Взять центральные 9 срезов
+            # center_idx = volume.shape[2] // 2
+            # start_idx = center_idx - 4
+            # end_idx = center_idx + 5
+            #
+            # final_volume = volume[:, :, start_idx:end_idx]
+            # final_volume = final_volume[20:172, 24:296, :]  # (152, 272, 9)
+            # final_volume = np.transpose(final_volume, (2, 0, 1))  # (9, 152, 272)
+            #
+            # logger.info(f"Финальный размер канала: {final_volume.shape}")
             
-            # Ресайз
-            target_size = (192, 320)
-            resized_slices = []
-            
-            for i in range(volume.shape[2]):
-                slice_2d = volume[:, :, i]
-                current_h, current_w = slice_2d.shape
-                
-                # Обрезка/дополнение по высоте
-                if current_h > target_size[0]:
-                    start_h = (current_h - target_size[0]) // 2
-                    slice_2d = slice_2d[start_h:start_h + target_size[0], :]
-                elif current_h < target_size[0]:
-                    pad_h = (target_size[0] - current_h) // 2
-                    slice_2d = np.pad(slice_2d, ((pad_h, target_size[0] - current_h - pad_h), (0, 0)), 
-                                    mode='constant', constant_values=0)
-                
-                # Обрезка/дополнение по ширине
-                if current_w > target_size[1]:
-                    start_w = (current_w - target_size[1]) // 2
-                    slice_2d = slice_2d[:, start_w:start_w + target_size[1]]
-                elif current_w < target_size[1]:
-                    pad_w = (target_size[1] - current_w) // 2
-                    slice_2d = np.pad(slice_2d, ((0, 0), (pad_w, target_size[1] - current_w - pad_w)), 
-                                    mode='constant', constant_values=0)
-                
-                if slice_2d.shape != target_size:
-                    slice_2d = cv2.resize(slice_2d, (target_size[1], target_size[0]), 
-                                        interpolation=cv2.INTER_CUBIC)
-                
-                resized_slices.append(slice_2d)
-            
-            volume = np.stack(resized_slices, axis=2)
-            logger.info(f"После ресайза: {volume.shape}")
-            
-            # Взять центральные 9 срезов
-            center_idx = volume.shape[2] // 2
-            start_idx = center_idx - 4
-            end_idx = center_idx + 5
-            
-            final_volume = volume[:, :, start_idx:end_idx]
-            final_volume = final_volume[20:172, 24:296, :]  # (152, 272, 9)
-            final_volume = np.transpose(final_volume, (2, 0, 1))  # (9, 152, 272)
-            
-            logger.info(f"Финальный размер канала: {final_volume.shape}")
-            
-            return final_volume
+            return volume
             
         except Exception as e:
             logger.error(f"Ошибка при обработке кан��ла: {e}")
@@ -534,14 +637,15 @@ class SpineGradingProcessor:
                 
                 # Преобразовать в предсказания
                 predictions = {}
-                for i, category in enumerate(self.categories):
-                    if i < len(outputs):
-                        logits = outputs[i]
-                        predicted_class = torch.argmax(logits, dim=1).item()
-                        predictions[category] = predicted_class
-                        logger.info(f"{category}: {predicted_class}")
+                for category in self.categories:
+                    logits = outputs[category]
+                    if logits.shape[1] > 1:
+                        predicted_class = torch.argmax(torch.softmax(logits, dim=1), dim=1).item()
                     else:
-                        predictions[category] = 0
+                        predicted_class = (torch.sigmoid(logits) >= 0.5).long().item()
+                    predictions[category] = predicted_class
+                    logger.info(f"{category}: {predicted_class}")
+
             
             return predictions
             

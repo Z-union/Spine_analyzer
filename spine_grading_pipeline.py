@@ -53,7 +53,6 @@ class SpineGradingPipeline:
         # Маппинг меток дисков (исправленный из main_refactored)
         from utils.constant import VERTEBRA_DESCRIPTIONS
         self.disc_labels_map = VERTEBRA_DESCRIPTIONS
-=======
         
         # Категории патологий
         self.categories = [

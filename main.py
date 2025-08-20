@@ -9,7 +9,6 @@ import os
 import time
 from pathlib import Path
 from typing import List, Dict, Optional
-import csv
 import pandas as pd
 
 import pydicom.dataset
@@ -32,11 +31,9 @@ except ImportError:
 
 import torch
 import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
+
 from PIL import Image, ImageDraw, ImageFont
 import cv2
-from scipy.ndimage import binary_erosion
 
 from utils.constant import LANDMARK_LABELS, VERTEBRA_DESCRIPTIONS, COLORS
 
@@ -65,10 +62,10 @@ def initialize_models_fixed(
             device=str(device),
             use_dual_channel=use_dual_channel_grading
         )
-        print(f"Инициализирован grading процессор (двухканальный: {use_dual_channel_grading})")
+        logging.info(f"Инициализирован grading процессор (двухканальный: {use_dual_channel_grading})")
     except Exception as e:
-        print(f"Ошибка при инициализации grading процессора: {e}")
-        print("Используется заглушка")
+        logging.warning(f"Ошибка при инициализации grading процессора: {e}")
+        logging.warning("Используется заглушка")
         grading_processor = None
     
     # Переводим модели сегментации в режим оценки
@@ -116,16 +113,12 @@ def process_study_with_measurements(
             logger.info(f"Найдены диски: {present_disks}")
         
         # Получаем данные изображения
-        if hasattr(nifti_img, 'get_fdata'):
-            mri_data = nifti_img.get_fdata()
-        else:
-            mri_data = np.asarray(nifti_img)
+        mri_data = [img.get_fdata() if hasattr(img, 'get_fdata') else None for img in nifti_img]
+        mri_data = mri_data[:-1]
+        example = next(arr for arr in mri_data if arr is not None)
+        mri_data = [arr if arr is not None else np.zeros_like(example) for arr in mri_data]
         
         mask_data = nifti_seg.get_fdata()
-        
-        # Обрабатываем диски с помощью grading процессора
-        disk_results = {}
-        grading_summary = {}
         
         if grading_processor is not None:
             if logger:
@@ -168,18 +161,18 @@ def process_study_with_measurements(
                     spondylolisthesis_count = 0
                     
                     for disk_label, measurements in pathology_measurements.items():
-                        if measurements.get('herniation', {}).get('detected', False):
+                        if measurements.get('Disc herniation', {}).get('detected', False):
                             herniation_count += 1
-                            volume = measurements['herniation']['volume_mm3']
-                            protrusion = measurements['herniation']['max_protrusion_mm']
+                            volume = measurements['Disc herniation']['volume_mm3']
+                            protrusion = measurements['Disc herniation']['max_protrusion_mm']
                             level_name = measurements.get('level_name', f'Disk_{disk_label}')
                             logger.info(f"Грыжа {level_name}: объем={volume:.1f}мм³, выпячивание={protrusion:.1f}мм")
                         
-                        if measurements.get('spondylolisthesis', {}).get('detected', False):
+                        if measurements.get('Spondylolisthesis', {}).get('detected', False):
                             spondylolisthesis_count += 1
-                            displacement = measurements['spondylolisthesis']['displacement_mm']
-                            percentage = measurements['spondylolisthesis']['displacement_percentage']
-                            grade = measurements['spondylolisthesis']['grade']
+                            displacement = measurements['Spondylolisthesis']['displacement_mm']
+                            percentage = measurements['Spondylolisthesis']['displacement_percentage']
+                            grade = measurements['Spondylolisthesis']['grade']
                             level_name = measurements.get('level_name', f'Disk_{disk_label}')
                             logger.info(f"Листез {level_name}: смещение={displacement:.1f}мм ({percentage:.1f}%), степень={grade}")
                     
@@ -294,11 +287,11 @@ def save_results_to_csv(results: Dict, output_dir: Path, logger: Optional[loggin
             # Добавляем результаты grading
             predictions = disk_result.get('predictions', {})
             row.update({
-                'pfirrmann_grade': predictions.get('Pfirrmann', 0),
-                'modic_changes': predictions.get('ModicChanges', 0),
-                'herniation_grade': predictions.get('Herniation', 0),
-                'bulging_grade': predictions.get('Bulging', 0),
-                'narrowing_grade': predictions.get('Narrowing', 0),
+                'pfirrmann_grade': predictions.get('Pfirrmann grade', 0),
+                'modic_changes': predictions.get('Modic', 0),
+                'herniation_grade': predictions.get('Disc herniation', 0),
+                'bulging_grade': predictions.get('Disc bulging', 0),
+                'narrowing_grade': predictions.get('Disc narrowing', 0),
                 'spondylolisthesis_grade': predictions.get('Spondylolisthesis', 0),
             })
             
@@ -306,7 +299,7 @@ def save_results_to_csv(results: Dict, output_dir: Path, logger: Optional[loggin
             disk_measurements = pathology_measurements.get(str(disk_label), {})
             
             # Грыжа
-            herniation = disk_measurements.get('herniation', {})
+            herniation = disk_measurements.get('Disc herniation', {})
             row.update({
                 'herniation_detected': herniation.get('detected', False),
                 'herniation_volume_mm3': herniation.get('volume_mm3', 0.0),
@@ -315,7 +308,7 @@ def save_results_to_csv(results: Dict, output_dir: Path, logger: Optional[loggin
             })
             
             # Листез
-            spondylolisthesis = disk_measurements.get('spondylolisthesis', {})
+            spondylolisthesis = disk_measurements.get('Spondylolisthesis', {})
             row.update({
                 'spondylolisthesis_detected': spondylolisthesis.get('detected', False),
                 'spondylolisthesis_displacement_mm': spondylolisthesis.get('displacement_mm', 0.0),
@@ -565,7 +558,7 @@ def parse_args():
     parser.add_argument(
         '--grading_model', 
         type=str, 
-        default='grading.pth',
+        default='model/weights/grading.pth',
         help='Путь к модели grading'
     )
     
@@ -738,9 +731,10 @@ def main():
             if not args.use_triton:
                 ax_model, sag_step_1_model, sag_step_2_model, grading_processor = models
                 nifti_img, nifti_seg = run_segmentation(studies, ax_model, sag_step_1_model, sag_step_2_model, logger)
-                
+
+                first_img = next(img for img in nifti_img if img is not None)
                 if nifti_img is not None and nifti_seg is not None:
-                    create_sagittal_images_with_segmentation(nifti_img, nifti_seg, args.output, logger)
+                    create_sagittal_images_with_segmentation(first_img, nifti_seg, args.output, logger)
                 else:
                     logger.warning("Не удалось создать сагиттальные изображения - сегментация недоступна")
             
@@ -754,12 +748,18 @@ def main():
                         level_name = disk_result.get('level_name', f'Disk_{disk_label}')
                         predictions = disk_result['predictions']
                         
-                        logger.info(f"Диск {level_name}:")
-                        logger.info(f"  - Pfirrmann: {predictions.get('Pfirrmann', 'N/A')}")
-                        logger.info(f"  - Modic: {predictions.get('ModicChanges', 'N/A')}")
-                        logger.info(f"  - Herniation: {predictions.get('Herniation', 'N/A')}")
-                        logger.info(f"  - Bulging: {predictions.get('Bulging', 'N/A')}")
-                        logger.info(f"  - Narrowing: {predictions.get('Narrowing', 'N/A')}")
+                        bbox = disk_result.get('bounds')
+                        center = disk_result.get('center')
+                        if bbox is not None:
+                            min_c, max_c = bbox
+                            logger.info(f"Диск {level_name}: bbox_min={tuple(min_c)}, bbox_max={tuple(max_c)}, center={tuple(center) if center is not None else 'N/A'}")
+                        else:
+                            logger.info(f"Диск {level_name}: bbox_min=None, bbox_max=None, center={tuple(center) if center is not None else 'N/A'}")
+                        logger.info(f"  - Pfirrmann: {predictions.get('Pfirrmann grade', 'N/A')}")
+                        logger.info(f"  - Modic: {predictions.get('Modic', 'N/A')}")
+                        logger.info(f"  - Herniation: {predictions.get('Disc herniation', 'N/A')}")
+                        logger.info(f"  - Bulging: {predictions.get('Disc bulging', 'N/A')}")
+                        logger.info(f"  - Narrowing: {predictions.get('Disc narrowing', 'N/A')}")
                         logger.info(f"  - Spondylolisthesis: {predictions.get('Spondylolisthesis', 'N/A')}")
                     elif 'error' in disk_result:
                         logger.warning(f"Диск {disk_label}: {disk_result['error']}")
@@ -776,37 +776,37 @@ def main():
                         positive_rate = (counts['positive'] / counts['total']) * 100 if counts['total'] > 0 else 0
                         logger.info(f"{pathology}: {counts['positive']}/{counts['total']} ({positive_rate:.1f}%) положительных")
             
-            # Сводка по измерениям патологий
-            if 'pathology_measurements' in results and results['pathology_measurements']:
-                logger.info("=== Сводка по измерениям патологий ===")
-                measurements = results['pathology_measurements']
+            # # Сводка по измерениям патологий
+            # if 'pathology_measurements' in results and results['pathology_measurements']:
+            #     logger.info("=== Сводка по измерениям патологий ===")
+            #     measurements = results['pathology_measurements']
+            #
+            #     total_herniation_volume = 0
+            #     total_displacement = 0
+            #     herniation_count = 0
+            #     spondylolisthesis_count = 0
                 
-                total_herniation_volume = 0
-                total_displacement = 0
-                herniation_count = 0
-                spondylolisthesis_count = 0
-                
-                for disk_label, disk_measurements in measurements.items():
-                    if isinstance(disk_measurements, dict) and 'error' not in disk_measurements:
-                        if disk_measurements.get('herniation', {}).get('detected', False):
-                            herniation_count += 1
-                            volume = disk_measurements['herniation']['volume_mm3']
-                            total_herniation_volume += volume
-                        
-                        if disk_measurements.get('spondylolisthesis', {}).get('detected', False):
-                            spondylolisthesis_count += 1
-                            displacement = disk_measurements['spondylolisthesis']['displacement_mm']
-                            total_displacement += displacement
-                
-                logger.info(f"Всего грыж: {herniation_count}")
-                if herniation_count > 0:
-                    logger.info(f"Общий объем грыж: {total_herniation_volume:.1f} мм³")
-                    logger.info(f"Средний объем грыжи: {total_herniation_volume/herniation_count:.1f} мм³")
-                
-                logger.info(f"Всего листезов: {spondylolisthesis_count}")
-                if spondylolisthesis_count > 0:
-                    logger.info(f"Общее смещение: {total_displacement:.1f} мм")
-                    logger.info(f"Среднее смещение: {total_displacement/spondylolisthesis_count:.1f} мм")
+                # for disk_label, disk_measurements in measurements.items():
+                #     if isinstance(disk_measurements, dict) and 'error' not in disk_measurements:
+                #         if disk_measurements.get('herniation', {}).get('detected', False):
+                #             herniation_count += 1
+                #             volume = disk_measurements['herniation']['volume_mm3']
+                #             total_herniation_volume += volume
+                #
+                #         if disk_measurements.get('spondylolisthesis', {}).get('detected', False):
+                #             spondylolisthesis_count += 1
+                #             displacement = disk_measurements['spondylolisthesis']['displacement_mm']
+                #             total_displacement += displacement
+                #
+                # logger.info(f"Всего грыж: {herniation_count}")
+                # if herniation_count > 0:
+                #     logger.info(f"Общий объем грыж: {total_herniation_volume:.1f} мм³")
+                #     logger.info(f"Средний объем грыжи: {total_herniation_volume/herniation_count:.1f} мм³")
+                #
+                # logger.info(f"Всего листезов: {spondylolisthesis_count}")
+                # if spondylolisthesis_count > 0:
+                #     logger.info(f"Общее смещение: {total_displacement:.1f} мм")
+                #     logger.info(f"Среднее смещение: {total_displacement/spondylolisthesis_count:.1f} мм")
         
         # Общее время выполнения
         total_time = time.time() - start_time

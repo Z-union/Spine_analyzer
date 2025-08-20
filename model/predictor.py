@@ -1,183 +1,179 @@
+import torch
 import numpy as np
 from scipy.ndimage import gaussian_filter
-
-from typing import Union, List, Tuple
-import torch
-
-def internal_predict_sliding_window_return_logits(
-        data: np.ndarray,
-        slicers,
-        network,
-        use_gaussian: bool = True,
-        patch_size: Tuple[int, ...] = None,
-        num_segmentation_heads: int = 9,
-        results_device = 'cpu',
-        mode: str = '3d',
-    ) -> torch.Tensor:
-    """
-    Версия NumPy: скользящее окно + (опционально) Gaussian-weighted fusion.
-    data: np.ndarray, форму которого предполагаем (C_in, D, H, W) или (C_in, H, W) для 2D.
-    slicers: список кортежей slice-объектов,
-             каждый sl ≃ (slice(...), slice(...), slice(...), slice(...)) (или без первой размерности, если 2D).
-    use_gaussian: True, если хотим применять гауссово-диффузный вес на патчы.
-    patch_size: соответствующий размер (D_patch, H_patch, W_patch) для compute_gaussian.
-    allow_tqdm, verbose: флаги вывода прогресса.
-    Возвращает: predicted_logits — np.ndarray формы (C_out, D, H, W) (или (C_out, H, W)),
-                 где C_out = self.label_manager.num_segmentation_heads.
-    """
-
-    # Приводим results_device к строке, если это torch.device
-    if isinstance(results_device, torch.device):
-        results_device = str(results_device)
-
-    data = torch.from_numpy(data)
-    data = data.to(results_device)
-    predicted_logits = n_predictions = prediction = gaussian = workon = None
-
-    try:
-        predicted_logits = torch.zeros((num_segmentation_heads, *data.shape[1:]),
-                                       dtype=torch.half,
-                                       device=results_device)
-        n_predictions = torch.zeros(data.shape[1:], dtype=torch.half, device=results_device)
-
-        if use_gaussian:
-            gaussian = compute_gaussian(patch_size, sigma_scale=1. / 8,
-                                        value_scaling_factor=10,
-                                        device=results_device)
-        else:
-            gaussian = 1.0
-
-        for sl in slicers:
-            workon = data[sl][None]
-            if mode == '2d':
-                workon = workon.squeeze(2)
-            workon = workon.to(results_device)
-
-            prediction = _internal_maybe_mirror_and_predict(workon, network.to(results_device))[0].to(results_device)
-
-            if use_gaussian:
-                prediction = prediction * gaussian
-            predicted_logits[sl] += prediction
-            n_predictions[sl[1:]] += gaussian
-
-        predicted_logits /= n_predictions
-
-        if torch.any(torch.isinf(predicted_logits)):
-            raise RuntimeError('Encountered inf in predicted array. Aborting... If this problem persists, '
-                               'reduce value_scaling_factor in compute_gaussian or increase the dtype of '
-                               'predicted_logits to fp32')
-
-    except Exception as e:
-        del predicted_logits, n_predictions, prediction, gaussian, workon
-        raise e
-    return predicted_logits
-
-@torch.inference_mode()
-def _internal_maybe_mirror_and_predict(x: torch.Tensor, network) -> torch.Tensor:
-    """
-    TTA-увеличение через зеркалирование для NumPy.
-    x: np.ndarray формы (C_in, D, H, W) или (C_in, H, W).
-    Возвращает: prediction: np.ndarray формы (C_out, D, H, W) или (C_out, H, W).
-    Предполагаем, что self.network принимает и возвращает np.ndarray.
-    """
-    network.eval()
-    with torch.no_grad():
-        prediction = network(x)
-    return prediction
+from typing import Union, List, Tuple, Optional
+import tritonclient.grpc as grpcclient
+from tritonclient.utils import InferenceServerException
 
 
 def compute_gaussian(
-    tile_size: Union[Tuple[int, ...], List[int]],
-    sigma_scale: float = 1. / 8,
-    value_scaling_factor: float = 1.0,
-    dtype=torch.float16,
-    device='cpu'
+        patch_size: Union[Tuple[int, ...], List[int]],
+        sigma_scale: float = 1 / 8,
+        value_scaling_factor: float = 1.0,
+        device: str = "cpu",
+        dtype=torch.float16
 ) -> torch.Tensor:
-    """
-    Вычисляет N-мерную «гауссову» карту важности (importance map) размерности tile_size.
+    tmp = np.zeros(patch_size, dtype=np.float32)
+    center = tuple(s // 2 for s in patch_size)
+    tmp[center] = 1.0
+    sigmas = [s * sigma_scale for s in patch_size]
+    gaussian_map = gaussian_filter(tmp, sigma=sigmas, mode="constant", cval=0.0)
+    gaussian_map = torch.from_numpy(gaussian_map).to(device=device, dtype=dtype)
+    gaussian_map /= torch.max(gaussian_map) / value_scaling_factor
+    gaussian_map[gaussian_map == 0] = torch.min(gaussian_map[gaussian_map != 0])
+    return gaussian_map
 
-    Алгоритм:
-    1. Создаёт массив tmp нулей формы tile_size и ставит «единицу» в центре.
-    2. Применяет scipy.ndimage.gaussian_filter с сигмами = (tile_size[i] * sigma_scale).
-    3. Нормализует так, чтобы максимум стал value_scaling_factor.
-    4. Меняет все нулевые значения (если они остались) на минимальное ненулевое значение.
 
-    :param tile_size: кортеж или список из целых — размерность создаваемой карты, напр. (Pz, Py, Px).
-    :param sigma_scale: масштаб для расчёта сигм: sigma[i] = tile_size[i] * sigma_scale.
-    :param value_scaling_factor: после применения фильтра минимум будет 0, максимум —
-                                 значение, равное value_scaling_factor.
-    :return: numpy.ndarray формы tile_size с отмасштабированной «гауссовой» картой.
-    """
+def compute_sliding_steps(image_size: Tuple[int, ...], patch_size: Tuple[int, ...], step_fraction: float = 0.5) -> List[
+    List[int]]:
+    steps = []
+    for img_dim, patch_dim in zip(image_size, patch_size):
+        max_step = img_dim - patch_dim
+        if max_step <= 0:
+            steps.append([0])
+            continue
+        num_steps = int(np.ceil(max_step / (patch_dim * step_fraction))) + 1
+        actual_step = max_step / max(num_steps - 1, 1)
+        steps.append([int(round(i * actual_step)) for i in range(num_steps)])
+    return steps
 
-    # 1) Создаём массив нулей и ставим 1 в центре
-    tmp = np.zeros(tile_size, dtype=np.float32)
-    center_coords = tuple(i // 2 for i in tile_size)
-    sigmas = [i * sigma_scale for i in tile_size]
-    tmp[center_coords] = 1.0
 
-    gaussian_importance_map = gaussian_filter(tmp, sigma=sigmas, mode='constant', cval=0.0)
-
-    gaussian_importance_map = torch.from_numpy(gaussian_importance_map)
-    gaussian_importance_map /= (torch.max(gaussian_importance_map) / value_scaling_factor)
-    gaussian_importance_map = gaussian_importance_map.to(device=device, dtype=dtype)
-
-    mask = gaussian_importance_map == 0
-    gaussian_importance_map[mask] = torch.min(gaussian_importance_map[~mask])
-    return gaussian_importance_map
-
-def internal_get_sliding_window_slicers(image_size: Tuple[int, ...], patch_size=[128, 96, 96], tile_step_size=0.5):
+def get_sliding_window_slicers(
+        image_size: Tuple[int, ...],
+        patch_size: Tuple[int, ...] = (128, 96, 96),
+        step_fraction: float = 0.5
+) -> List[Tuple[slice, ...]]:
     slicers = []
+    steps = compute_sliding_steps(image_size, patch_size, step_fraction)
     if len(patch_size) < len(image_size):
-        assert len(patch_size) == len(
-            image_size) - 1, 'if tile_size has less entries than image_size, ' \
-                             'len(tile_size) ' \
-                             'must be one shorter than len(image_size) ' \
-                             '(only dimension ' \
-                             'discrepancy of 1 allowed).'
-        steps = compute_steps_for_sliding_window(image_size[1:], patch_size,
-                                                 tile_step_size)
-
         for d in range(image_size[0]):
             for sx in steps[0]:
                 for sy in steps[1]:
                     slicers.append(
-                        tuple([slice(None), d, *[slice(si, si + ti) for si, ti in
-                                                 zip((sx, sy), patch_size)]]))
+                        tuple([slice(None), d, slice(sx, sx + patch_size[0]), slice(sy, sy + patch_size[1])]))
     else:
-        steps = compute_steps_for_sliding_window(image_size, patch_size,
-                                                 tile_step_size)
-
         for sx in steps[0]:
             for sy in steps[1]:
                 for sz in steps[2]:
-                    slicers.append(
-                        tuple([slice(None), *[slice(si, si + ti) for si, ti in
-                                              zip((sx, sy, sz), patch_size)]]))
+                    slicers.append(tuple([slice(None), slice(sx, sx + patch_size[0]),
+                                          slice(sy, sy + patch_size[1]), slice(sz, sz + patch_size[2])]))
     return slicers
 
 
-def compute_steps_for_sliding_window(image_size: Tuple[int, ...], tile_size: Tuple[int, ...], tile_step_size: float) -> \
-        List[List[int]]:
-    assert [i >= j for i, j in zip(image_size, tile_size)], "image size must be as large or larger than patch_size"
-    assert 0 < tile_step_size <= 1, 'step_size must be larger than 0 and smaller or equal to 1'
+@torch.inference_mode()
+def local_inference(batch: torch.Tensor, network: torch.nn.Module) -> torch.Tensor:
+    network.eval()
+    return network(batch)
 
-    # our step width is patch_size*step_size at most, but can be narrower. For example if we have image size of
-    # 110, patch size of 64 and step_size of 0.5, then we want to make 3 steps starting at coordinate 0, 23, 46
-    target_step_sizes_in_voxels = [i * tile_step_size for i in tile_size]
 
-    num_steps = [int(np.ceil((i - k) / j)) + 1 for i, j, k in zip(image_size, target_step_sizes_in_voxels, tile_size)]
+def triton_inference(batch_tensor: torch.Tensor, triton_client: grpcclient.InferenceServerClient, model_name: str,
+                     input_name: str, output_name: str) -> torch.Tensor:
+    """
+    Отправка батча на Triton ONNX Server через gRPC.
+    batch_tensor: CxDxHxW или BxCxDxHxW
+    """
+    batch_np = batch_tensor.cpu().numpy().astype(np.float32)
+    if batch_np.ndim == 4:
+        batch_np = batch_np[None]  # добавляем batch dim
 
-    steps = []
-    for dim in range(len(tile_size)):
-        # the highest step value for this dimension is
-        max_step_value = image_size[dim] - tile_size[dim]
-        if num_steps[dim] > 1:
-            actual_step_size = max_step_value / (num_steps[dim] - 1)
-        else:
-            actual_step_size = 99999999999  # does not matter because there is only one step at 0
+    inputs = [grpcclient.InferInput(input_name, batch_np.shape, "FP32")]
+    inputs[0].set_data_from_numpy(batch_np)
 
-        steps_here = [int(np.round(actual_step_size * i)) for i in range(num_steps[dim])]
+    outputs = [grpcclient.InferRequestedOutput(output_name)]
 
-        steps.append(steps_here)
+    try:
+        response = triton_client.infer(model_name=model_name, inputs=inputs, outputs=outputs)
+        pred = response.as_numpy(output_name)
+        pred_tensor = torch.from_numpy(pred).to(batch_tensor.device).half()
+        return pred_tensor
+    except InferenceServerException as e:
+        raise RuntimeError(f"Triton inference failed: {e}")
 
-    return steps
+
+def sliding_window_inference(
+        data: torch.Tensor,
+        slicers: List[tuple],
+        model_or_triton,
+        patch_size: Tuple[int, ...],
+        batch_size: int = 4,
+        num_heads: int = 9,
+        use_gaussian: bool = True,
+        device: str = "cpu",
+        mode: str = "3d",
+        triton_mode: bool = False,
+        triton_model_name: Optional[str] = None,
+        triton_input_name: Optional[str] = None,
+        triton_output_name: Optional[str] = None
+) -> torch.Tensor:
+    """
+    Скользящее окно с Gaussian fusion, работает локально или через Triton ONNX Server.
+    """
+    predicted_logits = torch.zeros((num_heads, *data.shape[1:]), dtype=torch.half, device=device)
+    n_predictions = torch.zeros(data.shape[1:], dtype=torch.half, device=device)
+    gaussian_map = compute_gaussian(patch_size, device=device) if use_gaussian else 1.0
+
+    batch_patches, batch_slicers = [], []
+
+    for sl in slicers:
+        patch = data[sl][None]
+        if mode == "2d" and patch.ndim == 5:
+            patch = patch.squeeze(2)
+        batch_patches.append(patch)
+        batch_slicers.append(sl)
+
+        if len(batch_patches) == batch_size or sl == slicers[-1]:
+            batch_tensor = np.concatenate(batch_patches, axis=0)
+
+            if triton_mode:
+                batch_pred = triton_inference(
+                    batch_tensor,
+                    model_or_triton,
+                    triton_model_name,
+                    triton_input_name,
+                    triton_output_name
+                )
+            else:
+                batch_pred = local_inference(torch.tensor(batch_tensor).to(device), model_or_triton)
+
+            for b, sl_b in enumerate(batch_slicers):
+                pred_patch = batch_pred[b]
+                if use_gaussian:
+                    pred_patch = pred_patch * gaussian_map
+                predicted_logits[sl_b] += pred_patch
+                n_predictions[sl_b[1:]] += gaussian_map
+
+            batch_patches, batch_slicers = [], []
+
+    predicted_logits /= n_predictions
+    return predicted_logits
+
+
+# -------------------------------
+# Пример локального и Triton инференса
+# -------------------------------
+if __name__ == "__main__":
+    # Dummy volume
+    C, D, H, W = 1, 128, 128, 128
+    dummy_volume = torch.randn((C, D, H, W), dtype=torch.float32)
+    patch_size = (64, 64, 64)
+    slicers = get_sliding_window_slicers(dummy_volume.shape, patch_size)
+
+
+    # --- Локальная модель ---
+    class DummyNet(torch.nn.Module):
+        def forward(self, x):
+            return torch.randn((x.shape[0], 9, *x.shape[2:]), device=x.device, dtype=torch.half)
+
+
+    net = DummyNet()
+    logits_local = sliding_window_inference(dummy_volume, slicers, net, patch_size, batch_size=2, device="cpu")
+    print("Local output shape:", logits_local.shape)
+
+    # --- Triton gRPC (пример) ---
+    # triton_client = grpcclient.InferenceServerClient(url="localhost:8001")
+    # logits_triton = sliding_window_inference(
+    #     dummy_volume, slicers, triton_client, patch_size, batch_size=2,
+    #     device="cpu", triton_mode=True, triton_model_name="my_model",
+    #     triton_input_name="input", triton_output_name="output"
+    # )
+    # print("Triton output shape:", logits_triton.shape)

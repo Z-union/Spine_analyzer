@@ -21,7 +21,7 @@ from utils import (
     largest_component, iterative_label, transform_seg2image, extract_alternate,
     fill_canal, crop_image2seg
 )
-from model import internal_predict_sliding_window_return_logits, internal_get_sliding_window_slicers
+from model import sliding_window_inference, get_sliding_window_slicers
 from dicom_io import load_study_dicoms
 from utils.constant import (
     LANDMARK_LABELS, VERTEBRA_DESCRIPTIONS, COLORS,
@@ -223,12 +223,19 @@ def run_segmentation(
             for step, model in [('step_1', sag_step_1_model), ('step_2', sag_step_2_model)]:
                 data, seg, properties = preprocessor.run_case(nifti_img, transpose_forward=[0, 1, 2])
                 img, slicer_revert_padding = pad_nd_image(data, SAG_PATCH_SIZE, 'constant', {"constant_values": 0}, True)
-                slicers = internal_get_sliding_window_slicers(img.shape[1:])
+                slicers = get_sliding_window_slicers(img.shape[1:])
                 
                 num_segmentation_heads = 9 if step == 'step_1' else 11
-                predicted_logits = internal_predict_sliding_window_return_logits(
-                    img, slicers, model, patch_size=SAG_PATCH_SIZE, 
-                    results_device=str(device), num_segmentation_heads=num_segmentation_heads
+                predicted_logits = sliding_window_inference(
+                    data=img,
+                    slicers=slicers,
+                    model_or_triton=model,  # локальная модель PyTorch
+                    patch_size=SAG_PATCH_SIZE,
+                    num_heads=num_segmentation_heads,
+                    batch_size=4,  # размер батча на скользящее окно
+                    device=device,  # torch.device("cuda") или "cpu"
+                    use_gaussian=True,  # оставляем Gaussian fusion
+                    mode="3d"  # "2d", если у тебя 2D данные
                 )
                 
                 predicted_logits = predicted_logits[(slice(None), *slicer_revert_padding[1:])]
@@ -289,12 +296,6 @@ def run_segmentation(
                     assert img_data.shape == seg_data.shape, f"Shapes do not match: {img_data.shape} vs {seg_data.shape}"
                     multi_channel = np.stack([img_data, seg_data], axis=0)
                     nifti_img = Nifti1Image(multi_channel, nifti_img.affine, nifti_img.header)
-            
-            # save(nifti_img, 'sagittal_processed.nii.gz')
-            # save(nifti_seg, 'sagittal_segmentation.nii.gz')
-            #
-            # if logger:
-            #     logger.info("Обработанные сагиттальные файлы сохранены: sagittal_processed.nii.gz, sagittal_segmentation.nii.gz")
         
         # Сегментация аксиала, если есть
         if ax_scan is not None:
@@ -306,11 +307,18 @@ def run_segmentation(
             
             data, seg, properties = preprocessor.run_case(axial, transpose_forward=[0, 1, 2])
             img, slicer_revert_padding = pad_nd_image(data, AX_PATCH_SIZE, 'constant', {"constant_values": 0}, True)
-            slicers = internal_get_sliding_window_slicers(img.shape[1:], patch_size=AX_PATCH_SIZE)
-            
-            predicted_logits = internal_predict_sliding_window_return_logits(
-                img, slicers, ax_model, patch_size=AX_PATCH_SIZE, 
-                results_device=str(device), num_segmentation_heads=5, mode='2d', use_gaussian=False
+            slicers = get_sliding_window_slicers(img.shape[1:], patch_size=AX_PATCH_SIZE)
+
+            predicted_logits = sliding_window_inference(
+                data=img,
+                slicers=slicers,
+                model_or_triton=ax_model,  # твоя локальная PyTorch модель
+                patch_size=AX_PATCH_SIZE,
+                num_heads=5,
+                batch_size=4,  # размер батча на скользящее окно
+                device=device,  # torch.device("cuda") или "cpu"
+                use_gaussian=False,  # выключаем Gaussian fusion
+                mode="2d"  # 2D режим
             )
             
             predicted_logits = predicted_logits[(slice(None), *slicer_revert_padding[1:])]
@@ -339,7 +347,7 @@ def run_segmentation(
         
         # Возвращаем результаты (приоритет: сагиттал -> аксиал)
         if nifti_img is not None and nifti_seg is not None:
-            return nifti_img, nifti_seg
+            return sagittals, nifti_seg
         elif ax_scan is not None:
             return processed_axial, ax_seg_nifti
         else:

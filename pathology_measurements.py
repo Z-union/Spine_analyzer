@@ -110,10 +110,10 @@ class PathologyMeasurements:
             bbox_size = (max_coords - min_coords) * np.array(self.voxel_spacing)
             
             # Высота диска (в сагиттальной проекции обычно по оси Y)
-            disk_height_mm = bbox_size[1]  # height dimension
+            disk_height_mm = bbox_size[2]  # height dimension
             
             # Диаметр диска (максимальный размер в аксиальной плоскости)
-            disk_diameter_mm = max(bbox_size[0], bbox_size[2])  # depth или width
+            disk_diameter_mm = max(bbox_size[0], bbox_size[1])  # depth или width
             
             return {
                 'volume_voxels': int(volume_voxels),
@@ -545,7 +545,7 @@ class PathologyMeasurements:
         return severity_map.get(grade, 'unknown')
 
 
-def measure_all_pathologies(mri_data: np.ndarray,
+def measure_all_pathologies(mri_data: List[np.ndarray],
                            mask_data: np.ndarray,
                            disk_results: Dict[int, Dict],
                            voxel_spacing: Tuple[float, float, float] = (1.0, 1.0, 1.0)) -> Dict[int, Dict]:
@@ -572,7 +572,7 @@ def measure_all_pathologies(mri_data: np.ndarray,
         level_name = disk_result.get('level_name', f'Disk_{disk_label}')
         
         # Проверяем, есть ли патологии для измерения
-        has_herniation = predictions.get('Herniation', 0) > 0
+        has_herniation = predictions.get('Disc herniation', 0) > 0
         has_spondylolisthesis = predictions.get('Spondylolisthesis', 0) > 0
         
         if has_herniation or has_spondylolisthesis:
