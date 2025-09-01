@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+pydantic-settings
+requests
+kafka-python
+python-dotenv
+torchio
+scikit-image
+pandas
+tritonclient[grpc]
+scipy
+opencv-python
+matplotlib

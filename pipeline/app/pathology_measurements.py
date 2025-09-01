@@ -9,7 +9,7 @@ import logging
 from typing import Dict, List, Tuple, Optional, Union
 from scipy import ndimage
 from skimage import measure, morphology
-from utils.constant import VERTEBRA_DESCRIPTIONS
+from config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -135,71 +135,50 @@ class PathologyMeasurements:
                            disk_label: int,
                            disk_mask: np.ndarray) -> Dict:
         """
-        Измеряет параметры грыжи диска.
-        
-        Args:
-            mri_data: Данные МРТ изображения
-            mask_data: Данные сегментации
-            disk_label: Метка диска
-            disk_mask: Маска диска
-            
-        Returns:
-            Словарь с измерениями грыжи
+        Измеряет параметры грыжи/выбухания как геометрические излишки диска относительно сглаженной базовой формы
+        в задней полуплоскости (по направлению к каналу, если доступен).
         """
         try:
-            # Находим границы диска
-            disk_boundary = self._find_disk_boundary(disk_mask)
-            
-            # Ищем выпячивания за пределы нормальной границы диска
-            herniation_mask = self._detect_herniation_regions(
-                mri_data, disk_mask, disk_boundary
-            )
-            
+            canal_mask = (mask_data == settings.CANAL_LABEL)
+            herniation_mask, base_mask = self._detect_herniation_regions(mri_data, mask_data, disk_mask, canal_mask)
+
             if not np.any(herniation_mask):
                 return {
                     'detected': False,
-                    'volume_mm3': 0,
-                    'max_protrusion_mm': 0,
+                    'volume_mm3': 0.0,
+                    'max_protrusion_mm': 0.0,
                     'regions_count': 0
                 }
-            
-            # Измеряем объем грыжи
-            herniation_volume_voxels = np.sum(herniation_mask)
-            herniation_volume_mm3 = herniation_volume_voxels * np.prod(self.voxel_spacing)
-            
-            # Находим максимальное выпячивание
-            max_protrusion_mm = self._calculate_max_protrusion(
-                disk_mask, herniation_mask, disk_boundary
-            )
-            
-            # Подсчитываем количество отдельных регионов грыжи
+
+            herniation_volume_voxels = int(np.sum(herniation_mask))
+            herniation_volume_mm3 = float(herniation_volume_voxels * np.prod(self.voxel_spacing))
+
+            base_boundary = self._find_disk_boundary(base_mask)
+            max_protrusion_mm = float(self._calculate_max_protrusion(disk_mask, herniation_mask, base_boundary))
+
             labeled_regions, num_regions = ndimage.label(herniation_mask)
-            
-            # Измеряем каждый регион грыжи
             regions_info = []
             for region_id in range(1, num_regions + 1):
                 region_mask = (labeled_regions == region_id)
-                region_volume = np.sum(region_mask) * np.prod(self.voxel_spacing)
+                region_volume = float(np.sum(region_mask) * np.prod(self.voxel_spacing))
                 region_coords = np.argwhere(region_mask)
                 region_centroid = region_coords.mean(axis=0)
-                
                 regions_info.append({
-                    'region_id': region_id,
-                    'volume_mm3': float(region_volume),
+                    'region_id': int(region_id),
+                    'volume_mm3': region_volume,
                     'centroid': region_centroid.tolist(),
                     'voxel_count': int(np.sum(region_mask))
                 })
-            
+
             return {
                 'detected': True,
-                'volume_mm3': float(herniation_volume_mm3),
-                'volume_voxels': int(herniation_volume_voxels),
-                'max_protrusion_mm': float(max_protrusion_mm),
+                'volume_mm3': herniation_volume_mm3,
+                'volume_voxels': herniation_volume_voxels,
+                'max_protrusion_mm': max_protrusion_mm,
                 'regions_count': int(num_regions),
                 'regions_info': regions_info,
                 'severity': self._classify_herniation_severity(herniation_volume_mm3, max_protrusion_mm)
             }
-            
         except Exception as e:
             logger.error(f"Ошибка при измерении грыжи: {e}")
             return {'error': str(e)}
@@ -280,78 +259,98 @@ class PathologyMeasurements:
     
     def _detect_herniation_regions(self, 
                                   mri_data: np.ndarray,
+                                  mask_data: np.ndarray,
                                   disk_mask: np.ndarray,
-                                  disk_boundary: np.ndarray) -> np.ndarray:
+                                  canal_mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Обнаруживает регионы грыжи как выпячивания за пределы нормальной границы диска.
-        
-        Args:
-            mri_data: Данные МРТ изображения
-            disk_mask: Маска диска
-            disk_boundary: Граница диска
-            
-        Returns:
-            Маска регионов грыжи
+        Геометрическое выделение выпячиваний/грыжи как излишков диска относительно базовой формы (морфологическое открытие)
+        в задней полуплоскости, определенной по направлению к каналу (если доступен).
+
+        Возвращает (herniation_mask_3d, base_mask_3d).
         """
         try:
-            # Расширяем маску диска для поиска выпячиваний
-            dilated_disk = morphology.binary_dilation(disk_mask, morphology.ball(3))
-            
-            # Ищем области с высокой интенсивностью за пределами нормальной границы
-            # Используем пороговое значение на основе статистики диска
-            disk_intensities = mri_data[disk_mask]
-            intensity_threshold = np.percentile(disk_intensities, 75)
-            
-            # Область поиска - расширенная маска минус исходная
-            search_area = dilated_disk & ~disk_mask
-            
-            # Находим области с высокой интенсивностью в области поиска
-            high_intensity_mask = (mri_data > intensity_threshold) & search_area
-            
-            # Очищаем маску от мелких артефактов
-            cleaned_mask = morphology.remove_small_objects(high_intensity_mask, min_size=5)
-            
-            return cleaned_mask
-            
+            zdim, ydim, xdim = disk_mask.shape
+            candidate = np.zeros_like(disk_mask, dtype=bool)
+            base_mask = np.zeros_like(disk_mask, dtype=bool)
+
+            # Структурный элемент ~2.5 мм по (y, x)
+            r_mm = 2.5
+            ry = max(1, int(round(r_mm / max(self.voxel_spacing[1], 1e-6))))
+            rx = max(1, int(round(r_mm / max(self.voxel_spacing[2], 1e-6))))
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * rx + 1, 2 * ry + 1))
+
+            coords = np.argwhere(disk_mask)
+            if coords.size == 0:
+                return candidate, base_mask
+            zc = int(np.round(coords[:, 0].mean()))
+            z_from = max(0, zc - 2)
+            z_to = min(zdim, zc + 3)
+
+            for z in range(z_from, z_to):
+                disk_slice = disk_mask[z].astype(np.uint8)
+                if disk_slice.sum() == 0:
+                    continue
+
+                base_slice = cv2.morphologyEx(disk_slice, cv2.MORPH_OPEN, kernel)
+                base_mask[z] = base_slice.astype(bool)
+
+                posterior_half = np.ones_like(disk_slice, dtype=bool)
+                canal_slice = canal_mask[z]
+                if canal_slice.any():
+                    dyx_disk = np.argwhere(disk_slice > 0)
+                    dyx_canal = np.argwhere(canal_slice > 0)
+                    if dyx_disk.size > 0 and dyx_canal.size > 0:
+                        cy, cx = dyx_disk.mean(axis=0)
+                        ky, kx = dyx_canal.mean(axis=0)
+                        v = np.array([ky - cy, kx - cx], dtype=np.float32)
+                        n = np.linalg.norm(v)
+                        if n > 0:
+                            v /= n
+                            yy, xx = np.mgrid[0:ydim, 0:xdim]
+                            posterior_half = ((yy - cy) * v[0] + (xx - cx) * v[1]) > 0
+
+                cand_slice = (disk_slice.astype(bool) & (~base_mask[z]) & posterior_half)
+                cand_slice = morphology.remove_small_objects(cand_slice, min_size=8)
+                candidate[z] = cand_slice
+
+            candidate = morphology.remove_small_objects(candidate, min_size=16)
+            return candidate, base_mask
         except Exception as e:
-            logger.error(f"Ошибка при обнаружении регионов грыжи: {e}")
-            return np.zeros_like(disk_mask, dtype=bool)
+            logger.error(f"Ошибка при геометрическом выделении грыжи: {e}")
+            return np.zeros_like(disk_mask, dtype=bool), np.zeros_like(disk_mask, dtype=bool)
     
     def _calculate_max_protrusion(self, 
                                  disk_mask: np.ndarray,
                                  herniation_mask: np.ndarray,
                                  disk_boundary: np.ndarray) -> float:
         """
-        Вычисляет максимальное выпячивание грыжи от границы диска.
-        
-        Args:
-            disk_mask: Маска диска
-            herniation_mask: Маска грыжи
-            disk_boundary: Граница диска
-            
-        Returns:
-            Максимальное выпячивание в мм
+        Вычисляет максимальное выпячивание (мм) как минимальное расстояние от каждой точки грыжи до базовой границы диска
+        с учётом анизотропии вокселей (перевод координат в мм).
         """
         try:
             if not np.any(herniation_mask):
                 return 0.0
-            
-            # Находим расстояние от каждой точки грыжи до ближайшей точки границы диска
+
             boundary_coords = np.argwhere(disk_boundary)
             herniation_coords = np.argwhere(herniation_mask)
-            
-            max_distance = 0.0
-            for hern_coord in herniation_coords:
-                # Находим минимальное расстояние до границы
-                distances = np.sqrt(np.sum((boundary_coords - hern_coord) ** 2, axis=1))
-                min_distance = np.min(distances)
-                max_distance = max(max_distance, min_distance)
-            
-            # Конвертируем в мм
-            max_distance_mm = max_distance * np.mean(self.voxel_spacing)
-            
-            return max_distance_mm
-            
+            if boundary_coords.size == 0 or herniation_coords.size == 0:
+                return 0.0
+
+            zs, ys, xs = self.voxel_spacing
+            boundary_mm = boundary_coords.astype(np.float32)
+            boundary_mm[:, 0] *= zs
+            boundary_mm[:, 1] *= ys
+            boundary_mm[:, 2] *= xs
+
+            max_min = 0.0
+            for p in herniation_coords:
+                pmm = p.astype(np.float32)
+                pmm[0] *= zs; pmm[1] *= ys; pmm[2] *= xs
+                d = np.sqrt(np.sum((boundary_mm - pmm) ** 2, axis=1))
+                min_d = float(np.min(d))
+                if min_d > max_min:
+                    max_min = min_d
+            return max_min
         except Exception as e:
             logger.error(f"Ошибка при вычислении максимального выпячивания: {e}")
             return 0.0
@@ -572,7 +571,7 @@ def measure_all_pathologies(mri_data: List[np.ndarray],
         level_name = disk_result.get('level_name', f'Disk_{disk_label}')
         
         # Проверяем, есть ли патологии для измерения
-        has_herniation = predictions.get('Disc herniation', 0) > 0
+        has_herniation = predictions.get('Herniation', 0) > 0
         has_spondylolisthesis = predictions.get('Spondylolisthesis', 0) > 0
         
         if has_herniation or has_spondylolisthesis:

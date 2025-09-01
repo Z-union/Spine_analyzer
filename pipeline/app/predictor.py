@@ -10,17 +10,15 @@ def compute_gaussian(
         patch_size: Union[Tuple[int, ...], List[int]],
         sigma_scale: float = 1 / 8,
         value_scaling_factor: float = 1.0,
-        device: str = "cpu",
-        dtype=torch.float16
-) -> torch.Tensor:
+        dtype=np.float16
+) -> np.ndarray:
     tmp = np.zeros(patch_size, dtype=np.float32)
     center = tuple(s // 2 for s in patch_size)
     tmp[center] = 1.0
     sigmas = [s * sigma_scale for s in patch_size]
-    gaussian_map = gaussian_filter(tmp, sigma=sigmas, mode="constant", cval=0.0)
-    gaussian_map = torch.from_numpy(gaussian_map).to(device=device, dtype=dtype)
-    gaussian_map /= torch.max(gaussian_map) / value_scaling_factor
-    gaussian_map[gaussian_map == 0] = torch.min(gaussian_map[gaussian_map != 0])
+    gaussian_map = gaussian_filter(tmp, sigma=sigmas, mode="constant", cval=0.0).astype(dtype)
+    gaussian_map /= np.max(gaussian_map) / value_scaling_factor
+    gaussian_map[gaussian_map == 0] = np.min(gaussian_map[gaussian_map != 0])
     return gaussian_map
 
 
@@ -66,51 +64,69 @@ def local_inference(batch: torch.Tensor, network: torch.nn.Module) -> torch.Tens
     return network(batch)
 
 
-def triton_inference(batch_tensor: torch.Tensor, triton_client: grpcclient.InferenceServerClient, model_name: str,
-                     input_name: str, output_name: str) -> torch.Tensor:
+def triton_inference(
+    batch_np: np.ndarray,
+    triton_client: grpcclient.InferenceServerClient,
+    model_name: str,
+    input_name: str,
+    output_names: list[str] | str,
+) -> dict[str, np.ndarray] | np.ndarray:
     """
     Отправка батча на Triton ONNX Server через gRPC.
-    batch_tensor: CxDxHxW или BxCxDxHxW
+    batch_np: CxDxHxW или BxCxDxHxW
+    output_names: имя выхода (str) или список имён выходов
+    Возвращает np.ndarray, если один output, иначе dict {output_name: np.ndarray}.
     """
-    batch_np = batch_tensor.cpu().numpy().astype(np.float32)
     if batch_np.ndim == 4:
-        batch_np = batch_np[None]  # добавляем batch dim
+        batch_np = batch_np[None]  # добавляем размерность батча
 
+    batch_np = batch_np.astype(np.float32)
+
+    # Приводим output_names к списку
+    if isinstance(output_names, str):
+        output_names = [output_names]
+
+    # Формируем вход
     inputs = [grpcclient.InferInput(input_name, batch_np.shape, "FP32")]
     inputs[0].set_data_from_numpy(batch_np)
 
-    outputs = [grpcclient.InferRequestedOutput(output_name)]
+    # Формируем список выходов
+    outputs = [grpcclient.InferRequestedOutput(name) for name in output_names]
 
     try:
-        response = triton_client.infer(model_name=model_name, inputs=inputs, outputs=outputs)
-        pred = response.as_numpy(output_name)
-        pred_tensor = torch.from_numpy(pred).to(batch_tensor.device).half()
-        return pred_tensor
+        response = triton_client.infer(
+            model_name=model_name,
+            inputs=inputs,
+            outputs=outputs
+        )
+        preds = {name: response.as_numpy(name) for name in output_names}
+        # Если один output — возвращаем np.ndarray
+        if len(preds) == 1:
+            return next(iter(preds.values()))
+        return preds
     except InferenceServerException as e:
         raise RuntimeError(f"Triton inference failed: {e}")
 
 
 def sliding_window_inference(
-        data: torch.Tensor,
+        data: np.ndarray,
         slicers: List[tuple],
-        model_or_triton,
         patch_size: Tuple[int, ...],
         batch_size: int = 4,
         num_heads: int = 9,
         use_gaussian: bool = True,
-        device: str = "cpu",
         mode: str = "3d",
-        triton_mode: bool = False,
+        triton_client: grpcclient.InferenceServerClient = None,
         triton_model_name: Optional[str] = None,
         triton_input_name: Optional[str] = None,
         triton_output_name: Optional[str] = None
-) -> torch.Tensor:
+) -> np.ndarray:
     """
     Скользящее окно с Gaussian fusion, работает локально или через Triton ONNX Server.
     """
-    predicted_logits = torch.zeros((num_heads, *data.shape[1:]), dtype=torch.half, device=device)
-    n_predictions = torch.zeros(data.shape[1:], dtype=torch.half, device=device)
-    gaussian_map = compute_gaussian(patch_size, device=device) if use_gaussian else 1.0
+    predicted_logits = np.zeros((num_heads, *data.shape[1:]), dtype=np.float16)
+    n_predictions = np.zeros(data.shape[1:], dtype=np.float16)
+    gaussian_map = compute_gaussian(patch_size) if use_gaussian else 1.0
 
     batch_patches, batch_slicers = [], []
 
@@ -124,16 +140,14 @@ def sliding_window_inference(
         if len(batch_patches) == batch_size or sl == slicers[-1]:
             batch_tensor = np.concatenate(batch_patches, axis=0)
 
-            if triton_mode:
-                batch_pred = triton_inference(
-                    batch_tensor,
-                    model_or_triton,
-                    triton_model_name,
-                    triton_input_name,
-                    triton_output_name
-                )
-            else:
-                batch_pred = local_inference(torch.tensor(batch_tensor).to(device), model_or_triton)
+
+            batch_pred = triton_inference(
+                batch_tensor,
+                triton_client,
+                triton_model_name,
+                triton_input_name,
+                triton_output_name
+            )
 
             for b, sl_b in enumerate(batch_slicers):
                 pred_patch = batch_pred[b]

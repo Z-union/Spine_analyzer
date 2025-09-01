@@ -1,0 +1,79 @@
+name: "grading"
+platform: "onnxruntime_onnx"
+max_batch_size: 32
+
+input [
+  {
+    name: "input"
+    data_type: TYPE_FP32
+    dims: [ 2, 32, 112, 32 ]   # C, D, H, W
+  }
+]
+
+output [
+  {
+    name: "Modic"
+    data_type: TYPE_FP32
+    dims: [ 5 ]
+  },
+  {
+    name: "UP endplate"
+    data_type: TYPE_FP32
+    dims: [ 1 ]
+  },
+  {
+    name: "LOW endplate"
+    data_type: TYPE_FP32
+    dims: [ 1 ]
+  },
+  {
+    name: "Spondylolisthesis"
+    data_type: TYPE_FP32
+    dims: [ 1 ]
+  },
+  {
+    name: "Disc herniation"
+    data_type: TYPE_FP32
+    dims: [ 1 ]
+  },
+  {
+    name: "Disc narrowing"
+    data_type: TYPE_FP32
+    dims: [ 1 ]
+  },
+  {
+    name: "Disc bulging"
+    data_type: TYPE_FP32
+    dims: [ 1 ]
+  },
+  {
+    name: "Pfirrmann grade"
+    data_type: TYPE_FP32
+    dims: [ 6 ]
+  }
+]
+
+instance_group [
+  { kind: KIND_CPU, count: 1 }
+]
+
+dynamic_batching {
+  preferred_batch_size: [4, 8, 16]
+  max_queue_delay_microseconds: 1000
+}
+
+optimization {
+  execution_accelerators {
+    gpu_execution_accelerator {
+      name: "tensorrt"
+    }
+    gpu_execution_accelerator {
+      name: "trt_fp16"
+    }
+  }
+}
+
+parameters {
+  key: "enable_memory_growth"
+  value: { string_value: "true" }
+}

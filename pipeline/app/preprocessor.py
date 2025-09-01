@@ -1,15 +1,13 @@
 from typing import Tuple, Union, List, Dict, Optional
 import scipy.ndimage as ndi
-from scipy.ndimage import binary_fill_holes
-from scipy.ndimage.interpolation import map_coordinates
+from scipy.ndimage import binary_fill_holes, map_coordinates
 import numpy as np
-import torch
 import nibabel as nib
-import SimpleITK as sitk
 from skimage.transform import resize
 import pandas as pd
 
 ANISO_THRESHOLD = 3
+
 
 def largest_component(
         seg: 'nib.nifti1.Nifti1Image',
@@ -53,14 +51,16 @@ def largest_component(
     output_seg = nib.Nifti1Image(output_seg_data, seg.affine, seg.header)
     return output_seg
 
+
 def bounding_box_to_slice(bounding_box: List[List[int]]) -> Tuple[slice, ...]:
     """
-    Преобразует bounding box в кортеж срезов для numpy-индексации.
+    Преобразует bounding box в кортеж срезов для numpy-инд��ксации.
     Все bounding box в acvl_utils и nnU-Netv2 — полуоткрытые интервалы [start, end)!
     :param bounding_box: Список пар [start, end] по каждому измерению.
     :return: Кортеж срезов для numpy.
     """
     return tuple([slice(*i) for i in bounding_box])
+
 
 class ImageReader:
     """
@@ -96,6 +96,7 @@ class ImageReader:
         }
         return data, properties
 
+
 class Normalizer:
     """
     Вспомогательный класс для нормализации данных изображений.
@@ -115,6 +116,7 @@ class Normalizer:
             image[idx] -= mean
             image[idx] /= (max(std, 1e-8))
         return image
+
 
 class MaskUtils:
     """
@@ -172,6 +174,7 @@ class MaskUtils:
                 maxyidx = y + 1
                 break
         return [[minzidx, maxzidx], [minxidx, maxxidx], [minyidx, maxyidx]]
+
 
 class Resampler:
     """
@@ -305,7 +308,7 @@ class Resampler:
 
 
 def _resample_data_or_seg_to_shape(
-    data: Union[torch.Tensor, np.ndarray],
+    data: np.ndarray,
     new_shape: Union[Tuple[int, ...], List[int], np.ndarray],
     current_spacing: Union[Tuple[float, ...], List[float], np.ndarray],
     new_spacing: Union[Tuple[float, ...], List[float], np.ndarray],
@@ -316,9 +319,9 @@ def _resample_data_or_seg_to_shape(
     separate_z_anisotropy_threshold: float = ANISO_THRESHOLD
 ) -> np.ndarray:
     """
-    Ресемплирует изображение или сегментацию до новой формы и разрешения.
+    Ресемплирует изображение или сегментацию до новой формы и ��азрешения.
 
-    :param data: Входные данные (np.ndarray или torch.Tensor)
+    :param data: Входные данные (np.ndarray)
     :param new_shape: Целевая форма
     :param current_spacing: Текущее разрешение
     :param new_spacing: Целевое разрешение
@@ -329,8 +332,6 @@ def _resample_data_or_seg_to_shape(
     :param separate_z_anisotropy_threshold: Порог анизотропии
     :return: Ресемплированные данные
     """
-    if isinstance(data, torch.Tensor):
-        data = data.cpu().numpy()
     if force_separate_z is not None:
         do_separate_z = force_separate_z
         if force_separate_z:
@@ -505,7 +506,7 @@ class DefaultPreprocessor:
         """
         Вычисляет bounding box бинарной маски (полуоткрытый интервал [start, end)).
 
-        :param mask: Бинарная маска
+        :param mask: Бинарная маск��
         :return: Bounding box в формате [[z_start, z_end], [x_start, x_end], [y_start, y_end]]
         """
         Z, X, Y = mask.shape
@@ -550,18 +551,14 @@ class DefaultPreprocessor:
 
     def convert_predicted_logits_to_segmentation_with_correct_shape(
         self,
-        predicted_logits: Union[torch.Tensor, np.ndarray],
-        num_threads_torch: int = 2
+        predicted_logits: np.ndarray,
     ):
         """
         Преобразует предсказанные логиты в сегментацию с восстановлением исходной формы изображения.
 
-        :param predicted_logits: Логиты (torch.Tensor или np.ndarray)
-        :param num_threads_torch: Количество потоков для torch
+        :param predicted_logits: Логиты (np.ndarray)
         :return: Сегментация исходной формы
         """
-        old_threads = torch.get_num_threads()
-        torch.set_num_threads(num_threads_torch)
         # ресемплируем к исходной форме
         current_spacing = self.properties['spacing'] if \
             len(self.properties['spacing']) == \
@@ -577,9 +574,6 @@ class DefaultPreprocessor:
         predicted_probabilities = self._apply_inference_nonlin(predicted_logits)
         del predicted_logits
         segmentation = self.convert_probabilities_to_segmentation(predicted_probabilities)
-        # переводим в numpy
-        if isinstance(segmentation, torch.Tensor):
-            segmentation = segmentation.cpu().numpy()
         # возвращаем сегментацию в bounding box (отмена кропа)
         segmentation_reverted_cropping = np.zeros(self.properties['shape_before_cropping'], dtype=np.uint8)
         slicer = self._bounding_box_to_slice(self.properties['bbox_used_for_cropping'])
@@ -590,11 +584,9 @@ class DefaultPreprocessor:
                                                                              'bbox_used_for_cropping'],
                                                                          self.properties[
                                                                              'shape_before_cropping'])
-        predicted_probabilities = predicted_probabilities.cpu().numpy()
         # revert transpose
         predicted_probabilities = predicted_probabilities.transpose([0] + [i + 1 for i in
                                                                            [0, 1, 2]])
-        torch.set_num_threads(old_threads)
 
         segmentation_reverted_cropping = self._format_seg(segmentation_reverted_cropping)
 
@@ -612,55 +604,47 @@ class DefaultPreprocessor:
         affine = np.eye(4)
         affine[:3, :3] = direction_matrix * spacing  # direction по столбцам, умножить на spacing
         affine[:3, 3] = origin
-        # seg = seg.transpose(1, 0, 2)
 
         # Создаём Nifti1Image
         seg_img = nib.Nifti1Image(seg.astype(np.uint8), affine)
 
         return seg_img
 
-
-    def _apply_inference_nonlin(self, logits: Union[np.ndarray, torch.Tensor]) -> Union[np.ndarray, torch.Tensor]:
+    def _apply_inference_nonlin(self, logits: np.ndarray) -> np.ndarray:
         """
         Применяет нелинейность (например, сигмоиду) к логитам для получения вероятностей.
         Ожидается форма (c, x, y, (z)), где c — количество классов/регионов.
 
-        :param logits: Логиты (np.ndarray или torch.Tensor)
-        :return: Вероятности (torch.Tensor)
+        :param logits: Логиты (np.ndarray)
+        :return: Вероятности (np.ndarray)
         """
-        if isinstance(logits, np.ndarray):
-            logits = torch.from_numpy(logits)
-        with torch.no_grad():
-            logits = logits.float()
-            probabilities = torch.sigmoid(logits)
+        logits = logits.astype(np.float32, copy=False)
+        probabilities = 1.0 / (1.0 + np.exp(-logits))
         return probabilities
 
     @staticmethod
-    def convert_probabilities_to_segmentation(predicted_probabilities: Union[np.ndarray, torch.Tensor]) -> Union[np.ndarray, torch.Tensor]:
+    def convert_probabilities_to_segmentation(predicted_probabilities: np.ndarray) -> np.ndarray:
         """
         Преобразует вероятности (после нелинейности) в карту сегментации.
         Ожидается форма (c, x, y, (z)), где c — количество классов/регионов.
 
-        :param predicted_probabilities: Вероятности (np.ndarray или torch.Tensor)
-        :return: Карта сегментации (np.ndarray или torch.Tensor)
+        :param predicted_probabilities: Вероятности (np.ndarray)
+        :return: Карта сегментации (np.ndarray)
         """
         regions_class_order = [i for i in range(1, predicted_probabilities.shape[0] + 1)]
-        if not isinstance(predicted_probabilities, (np.ndarray, torch.Tensor)):
-            raise RuntimeError(f"Unexpected input type. Expected np.ndarray or torch.Tensor, got {type(predicted_probabilities)}")
-        if isinstance(predicted_probabilities, np.ndarray):
-            segmentation = np.zeros(predicted_probabilities.shape[1:], dtype=np.uint16)
-        else:
-            segmentation = torch.zeros(predicted_probabilities.shape[1:], dtype=torch.int16, device=predicted_probabilities.device)
+        if not isinstance(predicted_probabilities, np.ndarray):
+            raise RuntimeError(f"Unexpected input type. Expected np.ndarray, got {type(predicted_probabilities)}")
+        segmentation = np.zeros(predicted_probabilities.shape[1:], dtype=np.uint16)
         for i, c in enumerate(regions_class_order):
             segmentation[predicted_probabilities[i] > 0.5] = c
         return segmentation
 
     def _revert_cropping_on_probabilities(
         self,
-        predicted_probabilities: Union[torch.Tensor, np.ndarray],
+        predicted_probabilities: np.ndarray,
         bbox: List[List[int]],
         original_shape: Union[List[int], Tuple[int, ...]]
-    ) -> Union[torch.Tensor, np.ndarray]:
+    ) -> np.ndarray:
         """
         Восстанавливает вероятности после кропа до исходной формы (только для вероятностей, не для логитов и не для карт сегментации!).
 
@@ -669,10 +653,7 @@ class DefaultPreprocessor:
         :param original_shape: Исходная форма
         :return: Вероятности, дополненные до исходной формы
         """
-        if isinstance(predicted_probabilities, np.ndarray):
-            probs_reverted_cropping = np.zeros((predicted_probabilities.shape[0], *original_shape), dtype=predicted_probabilities.dtype)
-        else:
-            probs_reverted_cropping = torch.zeros((predicted_probabilities.shape[0], *original_shape), dtype=predicted_probabilities.dtype)
+        probs_reverted_cropping = np.zeros((predicted_probabilities.shape[0], *original_shape), dtype=predicted_probabilities.dtype)
         slicer = bounding_box_to_slice(bbox)
         probs_reverted_cropping[tuple([slice(None)] + list(slicer))] = predicted_probabilities
         return probs_reverted_cropping

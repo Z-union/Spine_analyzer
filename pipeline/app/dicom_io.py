@@ -447,13 +447,51 @@ def get_orthanc_client():
     session.auth = (ORTHANC_USERNAME, ORTHANC_PASSWORD)
     return DICOMwebClient(ORTHANC_DICOMWEB_URL, session=session)
 
+
+def find_series(series_dict, is_sagittal=None, is_axial=None, is_coronal=None, seq_type=None):
+    for uid, paths in series_dict.items():
+        try:
+            # Проверяем первый срез серии на локализатор
+            first_dcm = dcmread(paths[0], stop_before_pixels=True)
+            if is_localizer_series(first_dcm):
+                continue
+            # Проверяем все срезы в серии, а не только первый
+            sagittal_slices = []
+            axial_slices = []
+            coronal_slices = []
+
+            for path in paths:
+                dcm = dcmread(path, stop_before_pixels=True)
+
+                # Проверяем тип последовательности
+                if seq_type and get_sequence_type(dcm) != seq_type:
+                    continue
+
+                # Группируем срезы по проекции
+                if is_sagittal_dicom_slice(dcm):
+                    sagittal_slices.append(path)
+                elif is_axial_dicom_slice(dcm):
+                    axial_slices.append(path)
+                elif is_coronal:
+                    # Если не сагиттальный и не аксиальный, считаем корональным
+                    coronal_slices.append(path)
+
+            # Возвращаем срезы нужной проекции
+            if is_sagittal and sagittal_slices:
+                return sagittal_slices
+            elif is_axial and axial_slices:
+                return axial_slices
+            elif is_coronal and coronal_slices:
+                return coronal_slices
+
+        except Exception:
+            continue
+    return None
+
 def load_study_dicoms(
     study_folder: str,
-    require_extensions: bool = True,
+    require_extensions: bool = False,
     metadata_overwrites: Optional[Dict] = None,
-    dicomweb: bool = False,
-    dicomweb_client: Optional[DICOMwebClient] = None,
-    study_uid: Optional[str] = None,
 ) -> Tuple[Tuple[Tuple[Optional[SpinalScan], Optional[SpinalScan], Optional[SpinalScan]],
                 Tuple[Optional[SpinalScan], Optional[SpinalScan], Optional[SpinalScan]],
                 Tuple[Optional[SpinalScan], Optional[SpinalScan], Optional[SpinalScan]]], list]:
@@ -464,116 +502,61 @@ def load_study_dicoms(
     '''
     if metadata_overwrites is None:
         metadata_overwrites = {}
-    if dicomweb:
-        # Если клиент не передан — создаём автоматически
-        if dicomweb_client is None:
-            dicomweb_client = get_orthanc_client()
-        if study_uid is None:
-            raise ValueError("study_uid должен быть передан при dicomweb=True")
-        instance_tuples = get_study_instances(dicomweb_client, study_uid)
-        from collections import defaultdict
-        series_dict = defaultdict(list)
-        for t in instance_tuples:
-            _, series_uid, _ = t
-            series_dict[series_uid].append(t)
-        scans = []
-        for series_uid, tuples in series_dict.items():
-            scan = process_single_series(tuples, require_extensions=False, dicomweb=True, dicomweb_client=dicomweb_client)
-            scans.append(scan)
-        return ((tuple(scans), (None, None, None), (None, None, None)), [])
-    else:
-        dicom_paths = [f for f in glob.glob(os.path.join(study_folder, '**', '*'), recursive=True) if os.path.isfile(f) and is_dicom_file(f)]
-        if not dicom_paths:
-            raise ValueError(f"В папке {study_folder} не найдено DICOM-файлов")
 
-        # Группировка по SeriesInstanceUID
-        series_dict = {}
-        for path in dicom_paths:
-            try:
-                dcm = dcmread(path, stop_before_pixels=True)
-                series_uid = getattr(dcm, 'SeriesInstanceUID', None)
-                if series_uid is not None:
-                    series_dict.setdefault(series_uid, []).append(path)
-            except Exception as e:
-                continue
+    dicom_paths = [f for f in glob.glob(os.path.join(study_folder, '**', '*'), recursive=True) if os.path.isfile(f) and is_dicom_file(f)]
+    if not dicom_paths:
+        raise ValueError(f"В папке {study_folder} не найдено DICOM-файлов")
 
-        # Для каждой проекции и режима ищем подходящую серию
-        def find_series(series_dict, is_sagittal=None, is_axial=None, is_coronal=None, seq_type=None):
-            for uid, paths in series_dict.items():
-                try:
-                    # Проверяем первый срез серии на локализатор
-                    first_dcm = dcmread(paths[0], stop_before_pixels=True)
-                    if is_localizer_series(first_dcm):
-                        continue
-                    # Проверяем все срезы в серии, а не только первый
-                    sagittal_slices = []
-                    axial_slices = []
-                    coronal_slices = []
-                    
-                    for path in paths:
-                        dcm = dcmread(path, stop_before_pixels=True)
-                        
-                        # Проверяем тип последовательности
-                        if seq_type and get_sequence_type(dcm) != seq_type:
-                            continue
-                        
-                        # Группируем срезы по проекции
-                        if is_sagittal_dicom_slice(dcm):
-                            sagittal_slices.append(path)
-                        elif is_axial_dicom_slice(dcm):
-                            axial_slices.append(path)
-                        elif is_coronal:
-                            # Если не сагиттальный и не аксиальный, считаем корональным
-                            coronal_slices.append(path)
-                    
-                    # Возвращаем срезы нужной проекции
-                    if is_sagittal and sagittal_slices:
-                        return sagittal_slices
-                    elif is_axial and axial_slices:
-                        return axial_slices
-                    elif is_coronal and coronal_slices:
-                        return coronal_slices
-                        
-                except Exception:
-                    continue
-            return None
+    # Группировка по SeriesInstanceUID
+    series_dict = {}
+    for path in dicom_paths:
+        try:
+            dcm = dcmread(path, stop_before_pixels=True)
+            series_uid = getattr(dcm, 'SeriesInstanceUID', None)
+            if series_uid is not None:
+                series_dict.setdefault(series_uid, []).append(path)
+        except Exception as e:
+            continue
 
-        # Для каждой проекции и режима
-        seqs = ['T1', 'T2', 'STIR']
-        sag_scans = []
-        ax_scans = []
-        cor_scans = []
-        for seq in seqs:
-            sag_paths = find_series(series_dict, is_sagittal=True, seq_type=seq)
-            ax_paths = find_series(series_dict, is_axial=True, seq_type=seq)
-            cor_paths = find_series(series_dict, is_coronal=True, seq_type=seq)
-            
-            # Используем новую функцию process_single_series вместо load_dicoms
-            sag_scan = process_single_series(sag_paths, require_extensions, metadata_overwrites) if sag_paths else None
-            ax_scan = process_single_series(ax_paths, require_extensions, metadata_overwrites) if ax_paths else None
-            cor_scan = process_single_series(cor_paths, require_extensions, metadata_overwrites) if cor_paths else None
-            
-            sag_scans.append(sag_scan)
-            ax_scans.append(ax_scan)
-            cor_scans.append(cor_scan)
+    # Для каждой проекции и режима ищем подходящую серию
 
-        # correspondence только для основной пары (например, T2)
-        # Найти первую непустую пару для correspondence
-        correspondence = []
-        for i, (sag, ax) in enumerate(zip(sag_scans, ax_scans)):
-            if sag is not None and ax is not None:
-                # Сопоставление срезов по координатам (используем Z-координату)
-                sag_ipps = np.array([dcmread(p, stop_before_pixels=True).ImagePositionPatient for p in series_dict[list(series_dict.keys())[i]]])
-                ax_ipps = np.array([dcmread(p, stop_before_pixels=True).ImagePositionPatient for p in series_dict[list(series_dict.keys())[i]]])
-                sag_z = sag_ipps[:, 2]
-                ax_z = ax_ipps[:, 2]
-                for j, sz in enumerate(sag_z):
-                    k = np.argmin(np.abs(ax_z - sz))
-                    distance = np.abs(ax_z[k] - sz)
-                    correspondence.append((j, k, sz, ax_z[k], distance))
-                break
 
-        return ((tuple(sag_scans), tuple(ax_scans), tuple(cor_scans)), correspondence)
+    # Для каждой проекции и режима
+    seqs = ['T1', 'T2', 'STIR']
+    sag_scans = []
+    ax_scans = []
+    cor_scans = []
+    for seq in seqs:
+        sag_paths = find_series(series_dict, is_sagittal=True, seq_type=seq)
+        ax_paths = find_series(series_dict, is_axial=True, seq_type=seq)
+        cor_paths = find_series(series_dict, is_coronal=True, seq_type=seq)
+
+        # Используем новую функцию process_single_series вместо load_dicoms
+        sag_scan = process_single_series(sag_paths, require_extensions, metadata_overwrites) if sag_paths else None
+        ax_scan = process_single_series(ax_paths, require_extensions, metadata_overwrites) if ax_paths else None
+        cor_scan = process_single_series(cor_paths, require_extensions, metadata_overwrites) if cor_paths else None
+
+        sag_scans.append(sag_scan)
+        ax_scans.append(ax_scan)
+        cor_scans.append(cor_scan)
+
+    # correspondence только для основной пары (например, T2)
+    # Найти первую непустую пару для correspondence
+    correspondence = []
+    for i, (sag, ax) in enumerate(zip(sag_scans, ax_scans)):
+        if sag is not None and ax is not None:
+            # Сопоставление срезов по координатам (используем Z-координату)
+            sag_ipps = np.array([dcmread(p, stop_before_pixels=True).ImagePositionPatient for p in series_dict[list(series_dict.keys())[i]]])
+            ax_ipps = np.array([dcmread(p, stop_before_pixels=True).ImagePositionPatient for p in series_dict[list(series_dict.keys())[i]]])
+            sag_z = sag_ipps[:, 2]
+            ax_z = ax_ipps[:, 2]
+            for j, sz in enumerate(sag_z):
+                k = np.argmin(np.abs(ax_z - sz))
+                distance = np.abs(ax_z[k] - sz)
+                correspondence.append((j, k, sz, ax_z[k], distance))
+            break
+
+    return ((tuple(sag_scans), tuple(ax_scans), tuple(cor_scans)), correspondence)
 
 
 def is_localizer_series(dicom_file: FileDataset) -> bool:

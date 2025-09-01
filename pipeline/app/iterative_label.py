@@ -1,12 +1,14 @@
 import scipy.ndimage as ndi
 import numpy as np
-import nibabel
+import nibabel as nib
 import torchio as tio
+import matplotlib.pyplot as plt
+import os
 
 
 def iterative_label(
-        seg: 'nibabel.nifti1.Nifti1Image',
-        loc: 'nibabel.nifti1.Nifti1Image' = None,
+        seg: 'nib.nifti1.Nifti1Image',
+        loc: 'nib.nifti1.Nifti1Image' = None,
         selected_disc_landmarks: list = [],
         disc_labels: list = [],
         disc_landmark_labels: list = [],
@@ -28,13 +30,13 @@ def iterative_label(
         map_input_dict: dict = {},
         dilation_size: int = 1,
         disc_default_superior_output: int = 0,
-    ) -> 'nibabel.nifti1.Nifti1Image':
+    ) -> 'nib.nifti1.Nifti1Image':
     """
     Итеративная разметка позвонков, межпозвоночных дисков, спинного мозга и канала по исходной сегментации.
     Алгоритм поэтапно выделяет компоненты, сортирует их, сопоставляет с анатомическими лендмарками и формирует итоговую разметку.
 
-    :param seg: nibabel.nifti1.Nifti1Image — исходная сегментация
-    :param loc: nibabel.nifti1.Nifti1Image — локализатор (опционально)
+    :param seg: nib.nifti1.Nifti1Image — исходная сегментация
+    :param loc: nib.nifti1.Nifti1Image — локализатор (опционально)
     :param selected_disc_landmarks: список меток дисков-ориентиров
     :param disc_labels: список меток дисков
     :param disc_landmark_labels: все возможные метки дисков-ориентиров
@@ -56,7 +58,7 @@ def iterative_label(
     :param map_input_dict: словарь сопоставления входных и выходных меток
     :param dilation_size: размер дилатации перед поиском компонент
     :param disc_default_superior_output: дефолтная метка верхнего диска
-    :return: nibabel.nifti1.Nifti1Image — сегментация с разметкой позвонков, дисков, канала и спинного мозга
+    :return: nib.nifti1.Nifti1Image — сегментация с разметкой позвонков, дисков, канала и спинного мозга
     """
     seg_data = np.asanyarray(seg.dataobj).round().astype(np.uint8).transpose(2, 1, 0)
 
@@ -70,7 +72,7 @@ def iterative_label(
     affine[0, 3] *= -1
     affine[1, 3] *= -1
 
-    seg = nibabel.Nifti1Image(seg_data, affine, seg.header)
+    seg = nib.Nifti1Image(seg_data, affine, seg.header)
     seg.set_qform(affine)
     seg.set_sform(affine)
 
@@ -305,7 +307,7 @@ def iterative_label(
     for orig, new in map_input_dict.items():
         output_seg_data[seg_data == int(orig)] = int(new)
 
-    output_seg = nibabel.Nifti1Image(output_seg_data, seg.affine, seg.header)
+    output_seg = nib.Nifti1Image(output_seg_data, seg.affine, seg.header)
 
     return output_seg
 
@@ -689,7 +691,7 @@ def extract_levels(
 
     Parameters
     ----------
-    seg : nibabel.Nifti1Image
+    seg : nib.Nifti1Image
         The input segmentation.
     canal_labels : list
         The canal labels.
@@ -700,7 +702,7 @@ def extract_levels(
 
     Returns
     -------
-    nibabel.Nifti1Image
+    nib.Nifti1Image
         The output segmentation with the vertebrae levels.
     '''
     seg_data = np.asanyarray(seg.dataobj).round().astype(np.uint8)
@@ -711,7 +713,7 @@ def extract_levels(
     affine[0, 2] = -0.0
     affine[1, 2] = -0.0
 
-    seg = nibabel.Nifti1Image(seg_data, affine, seg.header)
+    seg = nib.Nifti1Image(seg_data, affine, seg.header)
     seg.set_qform(affine)
     seg.set_sform(affine)
 
@@ -823,32 +825,36 @@ def extract_levels(
                 np.argmin(c1c2_distances_from_all_anteriorline, axis=1)]
             output_seg_data[tuple(c1c2_index_anteriorline[0])] = 2
 
-    output_seg = nibabel.Nifti1Image(output_seg_data, seg.affine, seg.header)
+    output_seg = nib.Nifti1Image(output_seg_data, seg.affine, seg.header)
 
     return output_seg
 
 def transform_seg2image(
         image,
         seg,
+        save_dir: str = None,
         interpolation='nearest',
     ):
-    '''
+    """
     Transform the segmentation to the image space to have the same origin, spacing, direction and shape as the image.
+    Optionally saves middle slices of image and segmentation for visual check.
 
     Parameters
     ----------
-    image : nibabel.Nifti1Image
+    image : nib.Nifti1Image
         Image.
-    seg : nibabel.Nifti1Image
+    seg : nib.Nifti1Image
         Segmentation.
+    save_dir : str, optional
+        Directory to save slices, defaults to None.
     interpolation : str, optional
-        Interpolation method, can be 'nearest', 'linear' or 'label' (for singel voxel labels), defaults to 'nearest'.
+        Interpolation method, can be 'nearest', 'linear' or 'label', defaults to 'nearest'.
 
     Returns
     -------
-    nibabel.Nifti1Image
+    nib.Nifti1Image
         Output segmentation.
-    '''
+    """
     # Check if the input image is 4D and take the first image from the last axis for resampling
     if len(np.asanyarray(image.dataobj).shape) == 4:
         image = image.slicer[..., 0]
@@ -862,64 +868,66 @@ def transform_seg2image(
         seg_data = seg_data.round().astype(np.uint8)
     seg_affine = seg.affine.copy()
 
-    # Dilations size - the maximum of factor by which the image zooms are larger than the segmentation zooms
+    # Dilations size
     dilation_size = int(np.ceil(np.max(np.array(image.header.get_zooms()) / np.array(seg.header.get_zooms()))))
-
-    # Pad width - maximum possible number of voxels the dilation can occupy in the image space
     pad_width = int(dilation_size * int(np.ceil(np.max(np.array(seg.header.get_zooms()) / np.array(image.header.get_zooms())))))
 
     if interpolation == 'label':
-        # Pad the image and segmentation to avoid labels at the edge bing displaced on center of mass calculation
         image_data = np.pad(image_data, pad_width)
         image_affine[:3, 3] -= (image_affine[:3, :3] @ ([pad_width] * 3))
         seg_data = np.pad(seg_data, pad_width)
         seg_affine[:3, 3] -= (seg_affine[:3, :3] @ ([pad_width] * 3))
-
-        # Dilate the segmentation to avoid interpolation artifacts
         seg_data = ndi.grey_dilation(seg_data, footprint=ndi.iterate_structure(ndi.generate_binary_structure(3, 3), dilation_size))
 
-    # Make TorchIO images
-    tio_img=tio.ScalarImage(tensor=image_data[None, ...], affine=image_affine)
-
-    # Define the segmentation as a ScalarImage or LabelMap based on the interpolation method
+    # TorchIO images
+    tio_img = tio.ScalarImage(tensor=image_data[None, ...], affine=image_affine)
     if interpolation == 'linear':
-        tio_seg=tio.ScalarImage(tensor=seg_data[None, ...], affine=seg_affine)
+        tio_seg = tio.ScalarImage(tensor=seg_data[None, ...], affine=seg_affine)
     else:
-        tio_seg=tio.LabelMap(tensor=seg_data[None, ...], affine=seg_affine)
+        tio_seg = tio.LabelMap(tensor=seg_data[None, ...], affine=seg_affine)
 
-    # Resample the segmentation to the image space
+    # Resample
     tio_output_seg = tio.Resample(tio_img)(tio_seg)
     output_seg_data = tio_output_seg.data.numpy()[0, ...]
-    if interpolation == 'linear':
-        output_seg_data = output_seg_data.astype(np.float32)
-    else:
+    if interpolation != 'linear':
         output_seg_data = output_seg_data.round().astype(np.uint8)
 
     if interpolation == 'label':
-        # Initialize the output segmentation to zeros
         com_output_seg_data = np.zeros_like(output_seg_data)
-
-        # Get the labels in the segmentation
         labels = [_ for _ in np.unique(output_seg_data) if _ != 0]
-
-        # Get the center of mass of each label
         com = ndi.center_of_mass(output_seg_data != 0, output_seg_data, labels)
-
-        # Set the labels at the center of mass
         for label, idx in zip(labels, com):
-            # Round the center of mass index
             idx = np.round(idx).astype(int)
-
-            # Clip the index to the segmentation shape
             idx = np.maximum(np.minimum(idx, np.array(com_output_seg_data.shape) - pad_width - 1), [pad_width] * 3)
-
-            # Set the label at the index
             com_output_seg_data[tuple(idx)] = label
-
-        # Remove the padding
         output_seg_data = com_output_seg_data[pad_width:-pad_width, pad_width:-pad_width, pad_width:-pad_width]
 
-    output_seg = nibabel.Nifti1Image(output_seg_data, image.affine, seg.header)
+    output_seg = nib.Nifti1Image(output_seg_data, image.affine, seg.header)
+
+    # Save slices if save_dir is specified
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)
+        mid_slices = [s // 2 for s in output_seg_data.shape]
+        fig, axes = plt.subplots(2, 3, figsize=(12, 8))
+        axes = axes.ravel()
+        # Axial
+        axes[0].imshow(image_data[:, :, mid_slices[2]], cmap='gray')
+        axes[0].set_title('Image Axial')
+        axes[1].imshow(output_seg_data[:, :, mid_slices[2]], cmap='tab20')
+        axes[1].set_title('Seg Axial')
+        # Sagittal
+        axes[2].imshow(image_data[mid_slices[0], :, :], cmap='gray')
+        axes[2].set_title('Image Sagittal')
+        axes[3].imshow(output_seg_data[mid_slices[0], :, :], cmap='tab20')
+        axes[3].set_title('Seg Sagittal')
+        # Coronal
+        axes[4].imshow(image_data[:, mid_slices[1], :], cmap='gray')
+        axes[4].set_title('Image Coronal')
+        axes[5].imshow(output_seg_data[:, mid_slices[1], :], cmap='tab20')
+        axes[5].set_title('Seg Coronal')
+        plt.tight_layout()
+        plt.savefig(os.path.join(save_dir, 'mid_slices.png'))
+        plt.close(fig)
 
     return output_seg
 
@@ -937,7 +945,7 @@ def extract_alternate(
 
     Parameters
     ----------
-    seg : nibabel.Nifti1Image
+    seg : nib.Nifti1Image
         The input segmentation.
     labels : list of int
         The labels to extract alternate elements from.
@@ -946,7 +954,7 @@ def extract_alternate(
 
     Returns
     -------
-    nibabel.Nifti1Image
+    nib.Nifti1Image
         The output segmentation with the vertebrae levels.
     '''
     seg_data = np.asanyarray(seg.dataobj).round().astype(np.uint8)
@@ -966,7 +974,7 @@ def extract_alternate(
 
     output_seg_data[np.isin(seg_data, selected_labels)] = 1
 
-    output_seg = nibabel.Nifti1Image(output_seg_data, seg.affine, seg.header)
+    output_seg = nib.Nifti1Image(output_seg_data, seg.affine, seg.header)
 
     return output_seg
 
@@ -983,7 +991,7 @@ def fill_canal(
 
     Parameters
     ----------
-    seg : nibabel.Nifti1Image
+    seg : nib.Nifti1Image
         Segmentation image.
     canal_label : int, optional
         Label used for Spinal Canal, defaults to 1.
@@ -996,7 +1004,7 @@ def fill_canal(
 
     Returns
     -------
-    nibabel.Nifti1Image
+    nib.Nifti1Image
         Output segmentation image with filled spinal canal.
     '''
     output_seg_data = np.asanyarray(seg.dataobj).round().astype(np.uint8)
@@ -1035,7 +1043,7 @@ def fill_canal(
         canal_mask = canal_mask & (output_seg_data != cord_label) if cord_label else canal_mask
         output_seg_data[canal_mask] = canal_label
 
-    output_seg = nibabel.Nifti1Image(output_seg_data, seg.affine, seg.header)
+    output_seg = nib.Nifti1Image(output_seg_data, seg.affine, seg.header)
 
     return output_seg
 
@@ -1058,16 +1066,16 @@ def crop_image2seg(
 
     Parameters
     ----------
-    image: nibabel.Nifti1Image
+    image: nib.Nifti1Image
         The image to crop.
-    seg: nibabel.Nifti1Image
+    seg: nib.Nifti1Image
         The segmentation to use for cropping.
     margin: int
         Margin to add to the cropped region in voxels, defaults to 0 - no margin.
 
     Returns
     -------
-    nibabel.Nifti1Image
+    nib.Nifti1Image
         The cropped image.
     '''
     seg_data = np.asanyarray(seg.dataobj).round().astype(np.uint8)

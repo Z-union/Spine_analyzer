@@ -1,11 +1,9 @@
 import numpy as np
 import nibabel as nib
-from scipy.ndimage import zoom, gaussian_filter
 from dicom_io import SpinalScan
 from skimage.transform import resize
 from typing import Union, List, Tuple
-import torch
-import itertools
+
 
 
 def resize_fn(image: np.ndarray, shape: Tuple[int, ...], order: int, mode: str) -> np.ndarray:
@@ -351,8 +349,40 @@ def pad_nd_image(
 
     return res, slicer
 
+def compute_sliding_steps(image_size: Tuple[int, ...], patch_size: Tuple[int, ...], step_fraction: float = 0.5) -> List[
+    List[int]]:
+    steps = []
+    for img_dim, patch_dim in zip(image_size, patch_size):
+        max_step = img_dim - patch_dim
+        if max_step <= 0:
+            steps.append([0])
+            continue
+        num_steps = int(np.ceil(max_step / (patch_dim * step_fraction))) + 1
+        actual_step = max_step / max(num_steps - 1, 1)
+        steps.append([int(round(i * actual_step)) for i in range(num_steps)])
+    return steps
 
-from tqdm import tqdm
+
+def get_sliding_window_slicers(
+        image_size: Tuple[int, ...],
+        patch_size: Tuple[int, ...] = (128, 96, 96),
+        step_fraction: float = 0.5
+) -> List[Tuple[slice, ...]]:
+    slicers = []
+    steps = compute_sliding_steps(image_size, patch_size, step_fraction)
+    if len(patch_size) < len(image_size):
+        for d in range(image_size[0]):
+            for sx in steps[0]:
+                for sy in steps[1]:
+                    slicers.append(
+                        tuple([slice(None), d, slice(sx, sx + patch_size[0]), slice(sy, sy + patch_size[1])]))
+    else:
+        for sx in steps[0]:
+            for sy in steps[1]:
+                for sz in steps[2]:
+                    slicers.append(tuple([slice(None), slice(sx, sx + patch_size[0]),
+                                          slice(sy, sy + patch_size[1]), slice(sz, sz + patch_size[2])]))
+    return slicers
 
 
 

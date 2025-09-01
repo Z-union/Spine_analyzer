@@ -1,0 +1,44 @@
+name: "seg_sag_stage_1"
+platform: "onnxruntime_onnx"
+max_batch_size: 32
+
+input [
+  {
+    name: "input"
+    data_type: TYPE_FP32
+    dims: [1, 128, 96, 96]
+  }
+]
+
+output [
+  {
+    name: "output"
+    data_type: TYPE_FP32
+    dims: [9, 128, 96, 96]
+  }
+]
+
+instance_group [
+  { kind: KIND_CPU, count: 1 }
+]
+
+dynamic_batching {
+  preferred_batch_size: [4, 8, 16]
+  max_queue_delay_microseconds: 1000
+}
+
+optimization {
+  execution_accelerators {
+    gpu_execution_accelerator {
+      name: "tensorrt"
+    }
+    gpu_execution_accelerator {
+      name: "trt_fp16"
+    }
+  }
+}
+
+parameters {
+  key: "enable_memory_growth"
+  value: { string_value: "true" }
+}
