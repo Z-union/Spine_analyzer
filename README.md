@@ -271,7 +271,7 @@ docker build -t spine-analyzer-triton ./triton
 
 ### Развертывание в продакшене
 
-Для продакшена используйте предоставленный `docker-compose.prod.yml`:
+Для продакшена используйте предоставленный `docker-compose.yml`:
 
 ```bash
 docker-compose -f docker-compose.prod.yml up -d
