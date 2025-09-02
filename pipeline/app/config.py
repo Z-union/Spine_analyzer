@@ -7,10 +7,20 @@ _BASE_DIR = Path(__file__).resolve().parents[2]
 _ENV_PATH = _BASE_DIR / ".env"
 
 class Settings(BaseSettings):
-    ORTHANC_URL: str = "http://localhost:8042"
+    # Logging Configuration
+    LOG_LEVEL: str = "INFO"
+    LOG_FORMAT: Optional[str] = None
+    
+    # Orthanc PACS Server
+    ORTHANC_URL: str = "http://orthanc:8042"
     ORTHANC_USER: str = "orthanc"
     ORTHANC_PASSWORD: str = "orthanc"
 
+    # Triton Inference Server
+    TRITON_URL: str = "triton:8001"
+    TRITON_TIMEOUT: Optional[int] = None
+    
+    # Kafka Configuration (optional - for async processing)
     KAFKA_BOOTSTRAP_SERVERS: Optional[str] = None
     KAFKA_TOPIC: Optional[str] = None
     KAFKA_GROUP_ID: Optional[str] = None
@@ -18,15 +28,36 @@ class Settings(BaseSettings):
     KAFKA_SSL_CAFILE: Optional[str] = None
     KAFKA_SSL_CERTFILE: Optional[str] = None
     KAFKA_SSL_KEYFILE: Optional[str] = None
+    KAFKA_SASL_MECHANISM: Optional[str] = None
+    KAFKA_SASL_USERNAME: Optional[str] = None
+    KAFKA_SASL_PASSWORD: Optional[str] = None
 
-    TRITON_URL: str = "http://orthanc:8001"
-
+    # Processing Configuration
     WORKERS: int = 2
-
     SAG_PATCH_SIZE: Optional[list[int]] = [128, 96, 96]
     AX_PATCH_SIZE: Optional[list[int]] = [224, 224]
-
     DILATE_SIZE: int = 5
+    CANAL_LABEL: int = 2
+    INFERENCE_BATCH_SIZE: int = 4
+    USE_GPU: bool = True
+    
+    # Performance Tuning
+    MAX_CONCURRENT_STUDIES: int = 2
+    MEMORY_LIMIT_MB: int = 4096
+    STUDY_TIMEOUT: int = 1800
+    
+    # Output Configuration
+    GENERATE_SR_REPORT: bool = True
+    GENERATE_SC_IMAGES: bool = True
+    MAX_SC_IMAGES: int = 50
+    SC_IMAGE_QUALITY: int = 95
+    
+    # Debug Options
+    DEBUG_MODE: bool = False
+    DEBUG_OUTPUT_DIR: str = "/tmp/spine_analyzer_debug"
+    SAVE_INTERMEDIATE_RESULTS: bool = False
+    
+    # Disk Labels and Descriptions
     EXTRACT_LABELS_RANGE: list[int] = list(range(63, 101))
     VERTEBRA_DESCRIPTIONS: dict[int, str] = {
         63: 'C2-C3', 64: 'C3-C4', 65: 'C4-C5', 66: 'C5-C6', 67: 'C6-C7',

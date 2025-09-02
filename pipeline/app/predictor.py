@@ -1,9 +1,13 @@
+import logging
 import torch
 import numpy as np
 from scipy.ndimage import gaussian_filter
-from typing import Union, List, Tuple, Optional
+from typing import Union, List, Tuple, Optional, Dict
 import tritonclient.grpc as grpcclient
 from tritonclient.utils import InferenceServerException
+
+# Use unified logger from main
+logger = logging.getLogger("dicom-pipeline")
 
 
 def compute_gaussian(
@@ -69,43 +73,63 @@ def triton_inference(
     triton_client: grpcclient.InferenceServerClient,
     model_name: str,
     input_name: str,
-    output_names: list[str] | str,
-) -> dict[str, np.ndarray] | np.ndarray:
+    output_names: Union[List[str], str],
+) -> Union[Dict[str, np.ndarray], np.ndarray]:
     """
-    Отправка батча на Triton ONNX Server через gRPC.
-    batch_np: CxDxHxW или BxCxDxHxW
-    output_names: имя выхода (str) или список имён выходов
-    Возвращает np.ndarray, если один output, иначе dict {output_name: np.ndarray}.
+    Send batch to Triton Inference Server via gRPC.
+    
+    Args:
+        batch_np: Input batch CxDxHxW or BxCxDxHxW
+        triton_client: Triton gRPC client
+        model_name: Name of the model in Triton
+        input_name: Name of the input tensor
+        output_names: Output name (str) or list of output names
+        
+    Returns:
+        np.ndarray if single output, dict {output_name: np.ndarray} otherwise
     """
-    if batch_np.ndim == 4:
-        batch_np = batch_np[None]  # добавляем размерность батча
-
-    batch_np = batch_np.astype(np.float32)
-
-    # Приводим output_names к списку
-    if isinstance(output_names, str):
-        output_names = [output_names]
-
-    # Формируем вход
-    inputs = [grpcclient.InferInput(input_name, batch_np.shape, "FP32")]
-    inputs[0].set_data_from_numpy(batch_np)
-
-    # Формируем список выходов
-    outputs = [grpcclient.InferRequestedOutput(name) for name in output_names]
-
+    logger.debug(f"Triton inference request - model: {model_name}, input shape: {batch_np.shape}")
+    
     try:
+        if batch_np.ndim == 4:
+            batch_np = batch_np[None]  # Add batch dimension
+            logger.debug(f"Added batch dimension, new shape: {batch_np.shape}")
+
+        batch_np = batch_np.astype(np.float32)
+
+        # Convert output_names to list
+        if isinstance(output_names, str):
+            output_names = [output_names]
+
+        # Prepare input
+        inputs = [grpcclient.InferInput(input_name, batch_np.shape, "FP32")]
+        inputs[0].set_data_from_numpy(batch_np)
+
+        # Prepare outputs
+        outputs = [grpcclient.InferRequestedOutput(name) for name in output_names]
+
+        logger.debug(f"Sending inference request to Triton for model {model_name}")
         response = triton_client.infer(
             model_name=model_name,
             inputs=inputs,
             outputs=outputs
         )
+        
         preds = {name: response.as_numpy(name) for name in output_names}
-        # Если один output — возвращаем np.ndarray
+        logger.debug(f"Inference successful, output shapes: {[{k: v.shape for k, v in preds.items()}]}")
+        
+        # Return np.ndarray if single output
         if len(preds) == 1:
             return next(iter(preds.values()))
         return preds
+        
     except InferenceServerException as e:
+        logger.error(f"Triton inference failed for model {model_name}: {str(e)}")
+        logger.debug(f"Failed inference details - input_shape: {batch_np.shape}, model: {model_name}")
         raise RuntimeError(f"Triton inference failed: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error during Triton inference: {str(e)}")
+        raise
 
 
 def sliding_window_inference(
@@ -122,44 +146,86 @@ def sliding_window_inference(
         triton_output_name: Optional[str] = None
 ) -> np.ndarray:
     """
-    Скользящее окно с Gaussian fusion, работает локально или через Triton ONNX Server.
+    Sliding window inference with Gaussian fusion.
+    Works with Triton Inference Server via gRPC.
+    
+    Args:
+        data: Input data array
+        slicers: List of slice tuples for patches
+        patch_size: Size of each patch
+        batch_size: Batch size for inference
+        num_heads: Number of output heads/classes
+        use_gaussian: Whether to use Gaussian weighting
+        mode: "2d" or "3d" mode
+        triton_client: Triton gRPC client
+        triton_model_name: Name of model in Triton
+        triton_input_name: Input tensor name
+        triton_output_name: Output tensor name
+        
+    Returns:
+        Predicted logits array
     """
-    predicted_logits = np.zeros((num_heads, *data.shape[1:]), dtype=np.float16)
-    n_predictions = np.zeros(data.shape[1:], dtype=np.float16)
-    gaussian_map = compute_gaussian(patch_size) if use_gaussian else 1.0
+    logger.info(f"Starting sliding window inference - model: {triton_model_name}, "
+               f"data shape: {data.shape}, patch_size: {patch_size}, "
+               f"num_slicers: {len(slicers)}, batch_size: {batch_size}")
+    
+    try:
+        predicted_logits = np.zeros((num_heads, *data.shape[1:]), dtype=np.float16)
+        n_predictions = np.zeros(data.shape[1:], dtype=np.float16)
+        gaussian_map = compute_gaussian(patch_size) if use_gaussian else 1.0
 
-    batch_patches, batch_slicers = [], []
+        batch_patches, batch_slicers = [], []
+        total_batches = (len(slicers) + batch_size - 1) // batch_size
+        processed_batches = 0
 
-    for sl in slicers:
-        patch = data[sl][None]
-        if mode == "2d" and patch.ndim == 5:
-            patch = patch.squeeze(2)
-        batch_patches.append(patch)
-        batch_slicers.append(sl)
+        for i, sl in enumerate(slicers):
+            patch = data[sl][None]
+            if mode == "2d" and patch.ndim == 5:
+                patch = patch.squeeze(2)
+            batch_patches.append(patch)
+            batch_slicers.append(sl)
 
-        if len(batch_patches) == batch_size or sl == slicers[-1]:
-            batch_tensor = np.concatenate(batch_patches, axis=0)
+            if len(batch_patches) == batch_size or sl == slicers[-1]:
+                batch_tensor = np.concatenate(batch_patches, axis=0)
+                
+                logger.debug(f"Processing batch {processed_batches + 1}/{total_batches}, "
+                           f"batch shape: {batch_tensor.shape}")
+                
+                try:
+                    batch_pred = triton_inference(
+                        batch_tensor,
+                        triton_client,
+                        triton_model_name,
+                        triton_input_name,
+                        triton_output_name
+                    )
+                except Exception as e:
+                    logger.error(f"Inference failed at batch {processed_batches + 1}/{total_batches}: {str(e)}")
+                    raise
 
+                for b, sl_b in enumerate(batch_slicers):
+                    pred_patch = batch_pred[b]
+                    if use_gaussian:
+                        pred_patch = pred_patch * gaussian_map
+                    predicted_logits[sl_b] += pred_patch
+                    n_predictions[sl_b[1:]] += gaussian_map
 
-            batch_pred = triton_inference(
-                batch_tensor,
-                triton_client,
-                triton_model_name,
-                triton_input_name,
-                triton_output_name
-            )
+                batch_patches, batch_slicers = [], []
+                processed_batches += 1
+                
+                if processed_batches % 10 == 0:
+                    logger.debug(f"Processed {processed_batches}/{total_batches} batches")
 
-            for b, sl_b in enumerate(batch_slicers):
-                pred_patch = batch_pred[b]
-                if use_gaussian:
-                    pred_patch = pred_patch * gaussian_map
-                predicted_logits[sl_b] += pred_patch
-                n_predictions[sl_b[1:]] += gaussian_map
-
-            batch_patches, batch_slicers = [], []
-
-    predicted_logits /= n_predictions
-    return predicted_logits
+        predicted_logits /= n_predictions
+        
+        logger.info(f"Sliding window inference completed successfully - "
+                   f"output shape: {predicted_logits.shape}")
+        
+        return predicted_logits
+        
+    except Exception as e:
+        logger.error(f"Sliding window inference failed: {str(e)}")
+        raise
 
 
 # -------------------------------

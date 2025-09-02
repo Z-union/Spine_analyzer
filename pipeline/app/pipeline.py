@@ -39,67 +39,92 @@ def save_segmentation_overlay_multiclass(
     colormap: dict = None
 ):
     """
-    Сохраняет срезы изображения с наложенной мультиклассовой сегментацией в виде контуров.
-
+    Save image slices with multiclass segmentation overlay as contours.
+    
     Parameters
     ----------
     image_nifti : nib.Nifti1Image
-        NIfTI изображение.
+        NIfTI image
     seg_nifti : nib.Nifti1Image
-        NIfTI сегментация с целыми метками классов.
-    output_dir : str
-        Папка для сохранения PNG срезов.
+        NIfTI segmentation with integer class labels
+    output_dir : str, optional
+        Directory to save PNG slices (if None, only returns images)
     slice_axis : int, optional
-        Ось срезов (по умолчанию 0).
+        Slice axis (default 0)
     thickness : int, optional
-        Толщина контура.
+        Contour thickness
     colormap : dict, optional
-        Словарь {label: (B, G, R)} для цветов. Если None — генерируются случайные цвета.
+        Dictionary {label: (B, G, R)} for colors. If None - random colors generated
+        
+    Returns
+    -------
+    list
+        List of overlay images as numpy arrays
     """
-    if output_dir is None:
-        os.makedirs(output_dir, exist_ok=True)
-
-    results = list()
-
-    image_data = np.asanyarray(image_nifti.dataobj)
-    seg_data = np.asanyarray(seg_nifti.dataobj).astype(np.uint8)
-
-    num_slices = image_data.shape[slice_axis]
-
-    # Автоматическая генерация цветов для классов
-    labels = np.unique(seg_data)
-    labels = labels[labels != 0]  # исключаем фон
-    if colormap is None:
-        np.random.seed(42)
-        colormap = {label: tuple(np.random.randint(0, 256, size=3).tolist()) for label in labels}
-
-    for i in range(num_slices):
-        # Выбираем срез
-        if slice_axis == 0:
-            img_slice = image_data[i, :, :]
-            seg_slice = seg_data[i, :, :]
-        elif slice_axis == 1:
-            img_slice = image_data[:, i, :]
-            seg_slice = seg_data[:, i, :]
-        else:
-            img_slice = image_data[:, :, i]
-            seg_slice = seg_data[:, :, i]
-
-        # Нормализуем изображение для отображения
-        img_norm = ((img_slice - np.min(img_slice)) / (np.ptp(img_slice) + 1e-8) * 255).astype(np.uint8)
-        img_color = cv2.cvtColor(img_norm, cv2.COLOR_GRAY2BGR)
-
-        # Рисуем контуры для каждого класса
-        for label, color in colormap.items():
-            mask = (seg_slice == label).astype(np.uint8)
-            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            cv2.drawContours(img_color, contours, -1, color, thickness)
+    results = []
+    
+    try:
+        image_data = np.asanyarray(image_nifti.dataobj)
+        seg_data = np.asanyarray(seg_nifti.dataobj).astype(np.uint8)
+        
+        num_slices = image_data.shape[slice_axis]
+        logger.debug(f"Creating segmentation overlays for {num_slices} slices")
+        
+        # Generate colors for classes
+        labels = np.unique(seg_data)
+        labels = labels[labels != 0]  # exclude background
+        if colormap is None:
+            np.random.seed(42)
+            colormap = {label: tuple(np.random.randint(0, 256, size=3).tolist()) for label in labels}
+        
+        logger.debug(f"Found {len(labels)} unique labels for overlay: {labels.tolist()}")
+        
+        # Create output directory if specified
+        if output_dir is not None:
+            os.makedirs(output_dir, exist_ok=True)
+            logger.debug(f"Saving overlays to directory: {output_dir}")
+        
+        for i in range(num_slices):
+            # Select slice
+            if slice_axis == 0:
+                img_slice = image_data[i, :, :]
+                seg_slice = seg_data[i, :, :]
+            elif slice_axis == 1:
+                img_slice = image_data[:, i, :]
+                seg_slice = seg_data[:, i, :]
+            else:
+                img_slice = image_data[:, :, i]
+                seg_slice = seg_data[:, :, i]
+            
+            # Skip empty slices
+            if np.sum(seg_slice) == 0:
+                continue
+            
+            # Normalize image for display
+            img_norm = ((img_slice - np.min(img_slice)) / (np.ptp(img_slice) + 1e-8) * 255).astype(np.uint8)
+            img_color = cv2.cvtColor(img_norm, cv2.COLOR_GRAY2BGR)
+            
+            # Draw contours for each class
+            for label, color in colormap.items():
+                mask = (seg_slice == label).astype(np.uint8)
+                if np.sum(mask) == 0:
+                    continue
+                contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                cv2.drawContours(img_color, contours, -1, color, thickness)
+            
             results.append(img_color)
-        # Сохраняем срез
-        if output_dir is None:
-            cv2.imwrite(os.path.join(output_dir, f"slice_{i:03d}.png"), img_color)
-
+            
+            # Save slice if output directory specified
+            if output_dir is not None:
+                output_path = os.path.join(output_dir, f"slice_{i:03d}.png")
+                cv2.imwrite(output_path, img_color)
+        
+        logger.info(f"Created {len(results)} segmentation overlay images")
         return results
+        
+    except Exception as e:
+        logger.error(f"Failed to create segmentation overlays: {str(e)}")
+        return []
 
 
 def measure_all_pathologies(mri_data: List[np.ndarray],
@@ -201,86 +226,154 @@ def _pick_best_scan(scan_tuple):
 
 def process_study_path(path: str, client: grpcclient.InferenceServerClient, study_id: Optional[str] = None) -> Dict[str, Any]:
     """
-    Здесь должна быть твоя доменная обработка исследования.
-
-    Вход:
-      - path: путь к скачанному архиву/папке с исследованием (временный ресурс)
-      - study_id: опционально для удобства логирования
-
-    Что делать внутри (примерный план):
-      - распаковать архив (если это архив) во временную папку
-      - найти нужные DICOM-файлы
-      - выполнить предобработку/инференс/постобработку
-      - результаты сохранить (БД/S3/файлы/публикация в Kafka и т.п.)
-
-    Важно: очистку временных ресурсов НЕ делать тут — это делает обёртка
-    run_pipeline_for_study(). Эта функция должна только обрабатывать и
-    возвращать результат (dict), пригодный для ответа REST или логирования в Kafka.
+    Process study from path (archive or directory).
+    
+    Args:
+        path: Path to downloaded archive/folder with study
+        study_id: Optional study ID for logging
+        client: Triton inference client
+        
+    Returns:
+        Dictionary with processing results
     """
-    logger.info(f"Processing study {study_id or ''} from path: {path}")
+    logger.info(f"Starting processing for study_id={study_id}, path={path}")
+    logger.debug(f"Path exists: {os.path.exists(path)}, is_file: {os.path.isfile(path)}, size: {os.path.getsize(path) if os.path.exists(path) else 'N/A'}")
 
     study_dir = None
     temp_dir = None
     try:
         is_file = os.path.isfile(path)
         size = os.path.getsize(path) if is_file else None
-        study_dir, temp_dir = _prepare_study_dir(path)
-        scans, correspondence = load_study_dicoms(study_dir)
+        logger.debug(f"Input type: {'file' if is_file else 'directory'}, size: {size} bytes")
+        
+        # Step 1: Prepare study directory
+        logger.info("Step 1: Preparing study directory")
+        try:
+            study_dir, temp_dir = _prepare_study_dir(path)
+            logger.info(f"Study directory prepared: {study_dir}, temp_dir: {temp_dir}")
+        except Exception as e:
+            logger.error(f"Failed to prepare study directory: {str(e)}")
+            raise
+        
+        # Step 2: Load DICOM files
+        logger.info("Step 2: Loading DICOM files")
+        try:
+            scans, correspondence = load_study_dicoms(study_dir)
+            sag_scans, ax_scans, cor_scans = scans
+            logger.info(f"DICOM files loaded - sagittal: {len([s for s in sag_scans if s is not None])}, "
+                       f"axial: {len([s for s in ax_scans if s is not None])}, "
+                       f"coronal: {len([s for s in cor_scans if s is not None])}, "
+                       f"correspondence pairs: {len(correspondence)}")
+        except Exception as e:
+            logger.error(f"Failed to load DICOM files: {str(e)}")
+            raise
 
-        sag_scans, ax_scans, _ = scans
+        # Step 3: Preprocessing - Average 4D
+        logger.info("Step 3: Averaging 4D scans")
+        try:
+            sag_scans = average4d(sag_scans)
+            ax_scans = average4d(ax_scans)
+            logger.debug("4D averaging completed")
+        except Exception as e:
+            logger.error(f"Failed during 4D averaging: {str(e)}")
+            raise
 
-        sag_scans = average4d(sag_scans)
-        ax_scans = average4d(ax_scans)
+        # Step 4: Reorient to canonical
+        logger.info("Step 4: Reorienting to canonical orientation")
+        try:
+            sag_scans = reorient_canonical(sag_scans)
+            ax_scans = reorient_canonical(ax_scans)
+            logger.debug("Reorientation completed")
+        except Exception as e:
+            logger.error(f"Failed during reorientation: {str(e)}")
+            raise
 
-        sag_scans = reorient_canonical(sag_scans)
-        ax_scans = reorient_canonical(ax_scans)
+        # Step 5: Resample
+        logger.info("Step 5: Resampling scans")
+        try:
+            sag_scans = resample(sag_scans)
+            ax_scans = resample(ax_scans)
+            logger.debug("Resampling completed")
+        except Exception as e:
+            logger.error(f"Failed during resampling: {str(e)}")
+            raise
 
-        sag_scans = resample(sag_scans)
-        ax_scans = resample(ax_scans)
-
+        # Step 6: Select best scan
+        logger.info("Step 6: Selecting best scan for segmentation")
         sag_scan = _pick_best_scan(sag_scans)
         ax_scan = _pick_best_scan(ax_scans)
+        
+        logger.info(f"Best scan selection - sagittal: {'found' if sag_scan is not None else 'not found'}, "
+                   f"axial: {'found' if ax_scan is not None else 'not found'}")
 
         if sag_scan is None and ax_scan is None:
-            if logger:
-                logger.error("Нет доступных сагиттальных или аксиальных сканов для сегментации!")
-            return None, None
+            logger.error("No sagittal or axial scans available for segmentation")
+            return {"error": "No suitable scans found for segmentation"}
 
         preprocessor = DefaultPreprocessor()
         nifti_img = None
         nifti_seg = None
 
-        # Сегментация сагиттала, если есть
+        # Step 7: Segmentation
         if sag_scan is not None:
-            if logger:
-                logger.info("Выбран сагиттальный скан для сегментации.")
+            logger.info("Step 7: Starting sagittal scan segmentation")
+            
+            try:
+                nifti_img = Nifti1Image(sag_scan.get_fdata()[np.newaxis, ...], sag_scan.affine, sag_scan.header)
+                logger.debug(f"Created NIfTI image with shape: {nifti_img.shape}")
+            except Exception as e:
+                logger.error(f"Failed to create NIfTI image: {str(e)}")
+                raise
 
-            # save(sag_scan, 'sagittal_original.nii.gz')
-            nifti_img = Nifti1Image(sag_scan.get_fdata()[np.newaxis, ...], sag_scan.affine, sag_scan.header)
-
-            # Двухэтапная сегментация
-            for step, model in [('step_1', 'seg_sag_stage_1'), ('step_2', 'seg_sag_stage_2')]:
-                data, seg, properties = preprocessor.run_case(nifti_img, transpose_forward=[0, 1, 2])
-                img, slicer_revert_padding = tools.pad_nd_image(data, settings.SAG_PATCH_SIZE, 'constant', {"constant_values": 0},
-                                                          True)
-                slicers = tools.get_sliding_window_slicers(img.shape[1:])
-                num_segmentation_heads = 9 if step == 'step_1' else 11
-                predicted_logits = sliding_window_inference(
-                    data=img,
-                    slicers=slicers,
-                    patch_size=settings.SAG_PATCH_SIZE,
-                    num_heads=num_segmentation_heads,
-                    batch_size=4,
-                    use_gaussian=True,
-                    mode="3d",
-                    triton_client=client,
-                    triton_model_name=model,
-                    triton_input_name='input',
-                    triton_output_name='output',
-                )
-                predicted_logits = predicted_logits[(slice(None), *slicer_revert_padding[1:])]
-                segmentation_reverted_cropping, predicted_probabilities = preprocessor.convert_predicted_logits_to_segmentation_with_correct_shape(
-                    predicted_logits)
+            # Two-stage segmentation
+            for step_num, (step, model) in enumerate([('step_1', 'seg_sag_stage_1'), ('step_2', 'seg_sag_stage_2')], 1):
+                logger.info(f"Step 7.{step_num}: Running segmentation {step} with model {model}")
+                
+                try:
+                    data, seg, properties = preprocessor.run_case(nifti_img, transpose_forward=[0, 1, 2])
+                    logger.debug(f"Preprocessor output shape: {data.shape}")
+                except Exception as e:
+                    logger.error(f"Preprocessor failed at {step}: {str(e)}")
+                    raise
+                
+                try:
+                    img, slicer_revert_padding = tools.pad_nd_image(data, settings.SAG_PATCH_SIZE, 'constant', 
+                                                                   {"constant_values": 0}, True)
+                    slicers = tools.get_sliding_window_slicers(img.shape[1:])
+                    num_segmentation_heads = 9 if step == 'step_1' else 11
+                    logger.debug(f"Padded image shape: {img.shape}, num_heads: {num_segmentation_heads}")
+                except Exception as e:
+                    logger.error(f"Failed to prepare image for inference at {step}: {str(e)}")
+                    raise
+                
+                logger.info(f"Running sliding window inference for {step}")
+                try:
+                    predicted_logits = sliding_window_inference(
+                        data=img,
+                        slicers=slicers,
+                        patch_size=settings.SAG_PATCH_SIZE,
+                        num_heads=num_segmentation_heads,
+                        batch_size=4,
+                        use_gaussian=True,
+                        mode="3d",
+                        triton_client=client,
+                        triton_model_name=model,
+                        triton_input_name='input',
+                        triton_output_name='output',
+                    )
+                    logger.debug(f"Inference completed for {step}, output shape: {predicted_logits.shape}")
+                except Exception as e:
+                    logger.error(f"Sliding window inference failed at {step}: {str(e)}")
+                    raise
+                
+                try:
+                    predicted_logits = predicted_logits[(slice(None), *slicer_revert_padding[1:])]
+                    segmentation_reverted_cropping, predicted_probabilities = preprocessor.convert_predicted_logits_to_segmentation_with_correct_shape(
+                        predicted_logits)
+                    logger.debug(f"Segmentation post-processing completed for {step}")
+                except Exception as e:
+                    logger.error(f"Post-processing failed at {step}: {str(e)}")
+                    raise
 
                 if not isinstance(segmentation_reverted_cropping, Nifti1Image):
                     seg_nifti = Nifti1Image(segmentation_reverted_cropping.astype(np.uint8), sag_scan.affine,
@@ -357,38 +450,36 @@ def process_study_path(path: str, client: grpcclient.InferenceServerClient, stud
 
         pathology_measurements = {}
         if disk_results and 'error' not in grading_summary:
-            if logger:
-                logger.info("Запускаем измерения патологий...")
+            logger.info("Starting pathology measurements")
 
             try:
                 pathology_measurements = measure_all_pathologies(
                     img_data, seg_data, disk_results)
 
-                if logger:
-                    logger.info(f"Измерения патологий завершены. Измерено дисков: {len(pathology_measurements)}")
+                logger.info(f"Pathology measurements completed. Measured disks: {len(pathology_measurements)}")
 
-                    # Выводим краткую статистику по измерениям
-                    herniation_count = 0
-                    spondylolisthesis_count = 0
+                # Output brief statistics on measurements
+                herniation_count = 0
+                spondylolisthesis_count = 0
 
-                    for disk_label, measurements in pathology_measurements.items():
-                        if measurements.get('Disc herniation', {}).get('detected', False):
-                            herniation_count += 1
-                            volume = measurements['Disc herniation']['volume_mm3']
-                            protrusion = measurements['Disc herniation']['max_protrusion_mm']
-                            level_name = measurements.get('level_name', f'Disk_{disk_label}')
-                            logger.info(f"Грыжа {level_name}: объем={volume:.1f}мм³, выпячивание={protrusion:.1f}мм")
+                for disk_label, measurements in pathology_measurements.items():
+                    if measurements.get('Disc herniation', {}).get('detected', False):
+                        herniation_count += 1
+                        volume = measurements['Disc herniation']['volume_mm3']
+                        protrusion = measurements['Disc herniation']['max_protrusion_mm']
+                        level_name = measurements.get('level_name', f'Disk_{disk_label}')
+                        logger.info(f"Herniation at {level_name}: volume={volume:.1f}mm3, protrusion={protrusion:.1f}mm")
 
-                        if measurements.get('Spondylolisthesis', {}).get('detected', False):
-                            spondylolisthesis_count += 1
-                            displacement = measurements['Spondylolisthesis']['displacement_mm']
-                            percentage = measurements['Spondylolisthesis']['displacement_percentage']
-                            grade = measurements['Spondylolisthesis']['grade']
-                            level_name = measurements.get('level_name', f'Disk_{disk_label}')
-                            logger.info(
-                                f"Листез {level_name}: смещение={displacement:.1f}мм ({percentage:.1f}%), степень={grade}")
+                    if measurements.get('Spondylolisthesis', {}).get('detected', False):
+                        spondylolisthesis_count += 1
+                        displacement = measurements['Spondylolisthesis']['displacement_mm']
+                        percentage = measurements['Spondylolisthesis']['displacement_percentage']
+                        grade = measurements['Spondylolisthesis']['grade']
+                        level_name = measurements.get('level_name', f'Disk_{disk_label}')
+                        logger.info(
+                            f"Spondylolisthesis at {level_name}: displacement={displacement:.1f}mm ({percentage:.1f}%), grade={grade}")
 
-                    logger.info(f"Итого: грыж={herniation_count}, листезов={spondylolisthesis_count}")
+                logger.info(f"Total pathologies found: herniations={herniation_count}, spondylolisthesis={spondylolisthesis_count}")
 
                 rows = []
 

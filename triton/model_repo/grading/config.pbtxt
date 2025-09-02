@@ -1,6 +1,6 @@
 name: "grading"
 platform: "onnxruntime_onnx"
-max_batch_size: 32
+max_batch_size: 16
 
 input [
   {
@@ -58,7 +58,7 @@ instance_group [
 ]
 
 dynamic_batching {
-  preferred_batch_size: [4, 8, 16]
+  preferred_batch_size: [4, 8]
   max_queue_delay_microseconds: 1000
 }
 

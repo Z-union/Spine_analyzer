@@ -30,6 +30,47 @@ class DICOMReportGenerator:
         self.study_info = study_info or {}
         self.orthanc_url = settings.ORTHANC_URL
         self.orthanc_auth = (settings.ORTHANC_USER, settings.ORTHANC_PASSWORD)
+    
+    def _create_concept_name_sequence(self, code_value: str, scheme: str, meaning: str) -> List[Dataset]:
+        """Helper to create ConceptNameCodeSequence"""
+        concept = Dataset()
+        concept.CodeValue = code_value
+        concept.CodingSchemeDesignator = scheme
+        concept.CodeMeaning = meaning
+        return [concept]
+    
+    def _create_measurement_units_sequence(self, code_value: str, scheme: str, meaning: str) -> List[Dataset]:
+        """Helper to create MeasurementUnitsCodeSequence"""
+        units = Dataset()
+        units.CodeValue = code_value
+        units.CodingSchemeDesignator = scheme
+        units.CodeMeaning = meaning
+        return [units]
+    
+    def _create_text_item(self, code_value: str, meaning: str, text_value: str) -> Dataset:
+        """Helper to create TEXT content item"""
+        item = Dataset()
+        item.ValueType = 'TEXT'
+        item.ConceptNameCodeSequence = self._create_concept_name_sequence(code_value, 'DCM', meaning)
+        item.TextValue = text_value
+        return item
+    
+    def _create_num_item(self, code_value: str, meaning: str, numeric_value: float, 
+                        unit_code: str, unit_scheme: str, unit_meaning: str) -> Dataset:
+        """Helper to create NUM content item"""
+        item = Dataset()
+        item.ValueType = 'NUM'
+        item.ConceptNameCodeSequence = self._create_concept_name_sequence(code_value, 'DCM', meaning)
+        
+        # Create MeasuredValueSequence
+        measured_value = Dataset()
+        measured_value.NumericValue = str(numeric_value)
+        measured_value.MeasurementUnitsCodeSequence = self._create_measurement_units_sequence(
+            unit_code, unit_scheme, unit_meaning
+        )
+        item.MeasuredValueSequence = [measured_value]
+        
+        return item
         
     def create_structured_report(self, 
                                 grading_results: Dict,
@@ -88,17 +129,21 @@ class DICOMReportGenerator:
         # Create SR content
         content_items = []
         
-        # Add title
-        content_items.append({
-            'ValueType': 'CONTAINER',
-            'ConceptNameCodeSequence': [{
-                'CodeValue': '121070',
-                'CodingSchemeDesignator': 'DCM',
-                'CodeMeaning': 'Findings'
-            }],
-            'ContinuityOfContent': 'SEPARATE',
-            'ContentSequence': []
-        })
+        # Add title - create as Dataset
+        title_item = Dataset()
+        title_item.ValueType = 'CONTAINER'
+        
+        # Create ConceptNameCodeSequence as a sequence of Datasets
+        concept_name = Dataset()
+        concept_name.CodeValue = '121070'
+        concept_name.CodingSchemeDesignator = 'DCM'
+        concept_name.CodeMeaning = 'Findings'
+        title_item.ConceptNameCodeSequence = [concept_name]
+        
+        title_item.ContinuityOfContent = 'SEPARATE'
+        title_item.ContentSequence = []
+        
+        content_items.append(title_item)
         
         # Add grading results
         if grading_results:
@@ -107,35 +152,27 @@ class DICOMReportGenerator:
                     level_name = result.get('level_name', f'Disk_{disk_label}')
                     disk_content = []
                     
-                    # Add disk level identifier
-                    disk_content.append({
-                        'ValueType': 'TEXT',
-                        'ConceptNameCodeSequence': [{
-                            'CodeValue': '121071',
-                            'CodingSchemeDesignator': 'DCM',
-                            'CodeMeaning': 'Finding'
-                        }],
-                        'TextValue': f'Disk Level: {level_name}'
-                    })
+                    # Add disk level identifier - create as Dataset
+                    disk_level_item = Dataset()
+                    disk_level_item.ValueType = 'TEXT'
+                    
+                    # Create ConceptNameCodeSequence
+                    concept = Dataset()
+                    concept.CodeValue = '121071'
+                    concept.CodingSchemeDesignator = 'DCM'
+                    concept.CodeMeaning = 'Finding'
+                    disk_level_item.ConceptNameCodeSequence = [concept]
+                    
+                    disk_level_item.TextValue = f'Disk Level: {level_name}'
+                    disk_content.append(disk_level_item)
                     
                     # Add grading scores
                     for category, value in result['predictions'].items():
-                        disk_content.append({
-                            'ValueType': 'NUM',
-                            'ConceptNameCodeSequence': [{
-                                'CodeValue': '121072',
-                                'CodingSchemeDesignator': 'DCM',
-                                'CodeMeaning': category
-                            }],
-                            'MeasuredValueSequence': [{
-                                'NumericValue': str(value),
-                                'MeasurementUnitsCodeSequence': [{
-                                    'CodeValue': '1',
-                                    'CodingSchemeDesignator': 'UCUM',
-                                    'CodeMeaning': 'grade'
-                                }]
-                            }]
-                        })
+                        score_item = self._create_num_item(
+                            '121072', category, value,
+                            '1', 'UCUM', 'grade'
+                        )
+                        disk_content.append(score_item)
                     
                     # Add pathology measurements if available
                     if disk_label in pathology_measurements:
@@ -145,82 +182,48 @@ class DICOMReportGenerator:
                         if measurements.get('herniation'):
                             hernia = measurements['herniation']
                             if hernia.get('detected'):
-                                disk_content.append({
-                                    'ValueType': 'NUM',
-                                    'ConceptNameCodeSequence': [{
-                                        'CodeValue': '121073',
-                                        'CodingSchemeDesignator': 'DCM',
-                                        'CodeMeaning': 'Herniation Volume'
-                                    }],
-                                    'MeasuredValueSequence': [{
-                                        'NumericValue': str(hernia.get('volume_mm3', 0)),
-                                        'MeasurementUnitsCodeSequence': [{
-                                            'CodeValue': 'mm3',
-                                            'CodingSchemeDesignator': 'UCUM',
-                                            'CodeMeaning': 'cubic millimeter'
-                                        }]
-                                    }]
-                                })
+                                volume_item = self._create_num_item(
+                                    '121073', 'Herniation Volume', 
+                                    hernia.get('volume_mm3', 0),
+                                    'mm3', 'UCUM', 'cubic millimeter'
+                                )
+                                disk_content.append(volume_item)
                                 
-                                disk_content.append({
-                                    'ValueType': 'NUM',
-                                    'ConceptNameCodeSequence': [{
-                                        'CodeValue': '121074',
-                                        'CodingSchemeDesignator': 'DCM',
-                                        'CodeMeaning': 'Herniation Protrusion'
-                                    }],
-                                    'MeasuredValueSequence': [{
-                                        'NumericValue': str(hernia.get('max_protrusion_mm', 0)),
-                                        'MeasurementUnitsCodeSequence': [{
-                                            'CodeValue': 'mm',
-                                            'CodingSchemeDesignator': 'UCUM',
-                                            'CodeMeaning': 'millimeter'
-                                        }]
-                                    }]
-                                })
+                                protrusion_item = self._create_num_item(
+                                    '121074', 'Herniation Protrusion',
+                                    hernia.get('max_protrusion_mm', 0),
+                                    'mm', 'UCUM', 'millimeter'
+                                )
+                                disk_content.append(protrusion_item)
                         
                         # Spondylolisthesis measurements
                         if measurements.get('spondylolisthesis'):
                             spondy = measurements['spondylolisthesis']
                             if spondy.get('detected'):
-                                disk_content.append({
-                                    'ValueType': 'NUM',
-                                    'ConceptNameCodeSequence': [{
-                                        'CodeValue': '121075',
-                                        'CodingSchemeDesignator': 'DCM',
-                                        'CodeMeaning': 'Spondylolisthesis Displacement'
-                                    }],
-                                    'MeasuredValueSequence': [{
-                                        'NumericValue': str(spondy.get('displacement_mm', 0)),
-                                        'MeasurementUnitsCodeSequence': [{
-                                            'CodeValue': 'mm',
-                                            'CodingSchemeDesignator': 'UCUM',
-                                            'CodeMeaning': 'millimeter'
-                                        }]
-                                    }]
-                                })
+                                displacement_item = self._create_num_item(
+                                    '121075', 'Spondylolisthesis Displacement',
+                                    spondy.get('displacement_mm', 0),
+                                    'mm', 'UCUM', 'millimeter'
+                                )
+                                disk_content.append(displacement_item)
                                 
-                                disk_content.append({
-                                    'ValueType': 'TEXT',
-                                    'ConceptNameCodeSequence': [{
-                                        'CodeValue': '121076',
-                                        'CodingSchemeDesignator': 'DCM',
-                                        'CodeMeaning': 'Spondylolisthesis Grade'
-                                    }],
-                                    'TextValue': f"Grade {spondy.get('grade', 'Unknown')}"
-                                })
+                                grade_item = self._create_text_item(
+                                    '121076', 'Spondylolisthesis Grade',
+                                    f"Grade {spondy.get('grade', 'Unknown')}"
+                                )
+                                disk_content.append(grade_item)
                     
-                    # Add disk container to main content
-                    content_items[0]['ContentSequence'].append({
-                        'ValueType': 'CONTAINER',
-                        'ConceptNameCodeSequence': [{
-                            'CodeValue': '121077',
-                            'CodingSchemeDesignator': 'DCM',
-                            'CodeMeaning': f'Disk Analysis: {level_name}'
-                        }],
-                        'ContinuityOfContent': 'SEPARATE',
-                        'ContentSequence': disk_content
-                    })
+                    # Add disk container to main content - create as Dataset
+                    disk_container = Dataset()
+                    disk_container.ValueType = 'CONTAINER'
+                    disk_container.ConceptNameCodeSequence = self._create_concept_name_sequence(
+                        '121077', 'DCM', f'Disk Analysis: {level_name}'
+                    )
+                    disk_container.ContinuityOfContent = 'SEPARATE'
+                    disk_container.ContentSequence = disk_content
+                    
+                    # Add to title item's ContentSequence
+                    title_item.ContentSequence.append(disk_container)
         
         ds.ContentSequence = content_items
         
