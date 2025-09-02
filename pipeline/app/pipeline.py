@@ -11,21 +11,23 @@ import tritonclient.grpc as grpcclient
 import pandas as pd
 import cv2
 
-from orthanc_client import fetch_study_temp
-from config import settings
+from .orthanc_client import fetch_study_temp
+from .config import settings
 
-import tools
-import iterative_label
-import grading_processor
-from preprocessor import DefaultPreprocessor, largest_component
-from dicom_io import load_study_dicoms
-from average4d import average4d
-from reorient_canonical import reorient_canonical
-from resample import resample
-from predictor import sliding_window_inference
-from pathology_measurements import PathologyMeasurements
+from . import tools
+from . import iterative_label
+from . import grading_processor
+from .preprocessor import DefaultPreprocessor, largest_component
+from .dicom_io import load_study_dicoms
+from .average4d import average4d
+from .reorient_canonical import reorient_canonical
+from .resample import resample
+from .predictor import sliding_window_inference
+from .pathology_measurements import PathologyMeasurements
+from .dicom_reports import send_reports_to_orthanc
 
-logger = logging.getLogger(__name__)
+# Используем единый логгер из main
+logger = logging.getLogger("dicom-pipeline")
 
 
 def save_segmentation_overlay_multiclass(
@@ -438,7 +440,9 @@ def process_study_path(path: str, client: grpcclient.InferenceServerClient, stud
             "series_detected": present_counts,
             "correspondence_pairs": len(correspondence),
             "results": df.to_json(orient="records", indent=2),
-            "segmentations": segmentations
+            "segmentations": segmentations,
+            "disk_results": disk_results,
+            "pathology_measurements": pathology_measurements
         }
     finally:
         # Clean up only the extraction dir we created here (not the downloaded tmp archive)
@@ -451,7 +455,8 @@ def run_pipeline_for_study(study_id: str) -> Dict[str, Any]:
     Оркестрация пайплайна для одного исследования:
       1) Скачать исследование из Orthanc во временный ресурс
       2) Передать путь в доменную обработку process_study_path()
-      3) Корректно удалить временные файлы/папки независимо от исхода
+      3) Отправить SR и SC отчеты обратно в Orthanc
+      4) Корректно удалить временные файлы/папки независимо от исхода
 
     Возвращает dict, готовый к отдаче наружу либо к публикации.
     """
@@ -461,14 +466,66 @@ def run_pipeline_for_study(study_id: str) -> Dict[str, Any]:
         tmp_path = fetch_study_temp(study_id)
         logger.info(f"Study {study_id} downloaded to temp: {tmp_path}")
 
+        # Обработка исследования
         result = process_study_path(tmp_path, study_id=study_id, client=client)
+        
+        # Отправка отчетов в Orthanc
+        report_upload_result = {"sr_uploaded": False, "sc_uploaded": False}
+        if result:
+            # Извлекаем данные для отчетов напрямую из результата
+            grading_results = result.get("disk_results", {})
+            pathology_measurements = result.get("pathology_measurements", {})
+            segmentation_images = result.get("segmentations", [])
+            
+            # Отправляем отчеты в Orthanc
+            try:
+                report_upload_result = send_reports_to_orthanc(
+                    study_id=study_id,
+                    grading_results=grading_results,
+                    pathology_measurements=pathology_measurements,
+                    segmentation_images=segmentation_images
+                )
+                logger.info(f"Reports uploaded to Orthanc for study {study_id}: {report_upload_result}")
+            except Exception as e:
+                logger.error(f"Failed to upload reports to Orthanc: {e}")
+                report_upload_result["errors"] = [str(e)]
+        
+        # TODO: Отправка уведомления о завершении обработки через Kafka
+        # Здесь должен быть код для публикации сообщения в Kafka топик
+        # с информацией о завершении обработки и результатах
+        # Например:
+        # kafka_producer.send(
+        #     topic='spine-analysis-completed',
+        #     value={
+        #         'study_id': study_id,
+        #         'status': 'completed',
+        #         'sr_uploaded': report_upload_result.get('sr_uploaded', False),
+        #         'sc_uploaded': report_upload_result.get('sc_uploaded', False),
+        #         'sc_count': report_upload_result.get('sc_count', 0),
+        #         'timestamp': datetime.now().isoformat()
+        #     }
+        # )
+        
         return {
             "status": "ok",
             "study_id": study_id,
             "pipeline_result": result,
+            "report_upload": report_upload_result
         }
     except Exception:
         logger.exception(f"Pipeline failed for study {study_id}")
+        
+        # TODO: Отправка уведомления об ошибке через Kafka
+        # kafka_producer.send(
+        #     topic='spine-analysis-failed',
+        #     value={
+        #         'study_id': study_id,
+        #         'status': 'failed',
+        #         'error': str(e),
+        #         'timestamp': datetime.now().isoformat()
+        #     }
+        # )
+        
         # Пробрасываем исключение, чтобы HTTP вернул 500, а Kafka увидела ошибку в логах
         raise
     finally:

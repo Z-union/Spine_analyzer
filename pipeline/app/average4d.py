@@ -1,4 +1,3 @@
-import nibabel
 import nibabel as nib
 import numpy as np
 
@@ -48,7 +47,7 @@ def average4d(med_data: list) -> list:
 
     return res
 
-def _average4d(image: 'nibabel.nifti1.Nifti1Image') -> 'nibabel.nifti1.Nifti1Image':
+def _average4d(image: 'nib.nifti1.Nifti1Image') -> 'nib.nifti1.Nifti1Image':
     """
     Усредняет последнее измерение 4D-изображения, получая 3D-объём.
 

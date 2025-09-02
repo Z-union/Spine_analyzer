@@ -7,7 +7,6 @@ import argparse
 import numpy as np
 from pydicom import dcmread, FileDataset, DataElement
 from pydicom.tag import Tag
-import nibabel as nib
 from nibabel.nifti1 import Nifti1Image
 from dicomweb_client.api import DICOMwebClient
 import io

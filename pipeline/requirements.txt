@@ -4,6 +4,7 @@ pydantic-settings
 requests
 kafka-python
 python-dotenv
+python-multipart
 torchio
 scikit-image
 pandas
@@ -11,3 +12,7 @@ tritonclient[grpc]
 scipy
 opencv-python
 matplotlib
+pydicom
+dicomweb-client
+nibabel
+numpy

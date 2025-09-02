@@ -1,10 +1,7 @@
-version: "3.8"
-
 services:
   pipeline:
     build:
       context: ./pipeline
-    image: mri-pipeline:latest
     container_name: mri-pipeline
     env_file:
       - .env
@@ -12,24 +9,30 @@ services:
       - "8000:8000"
     depends_on:
       - orthanc
+      - triton
 
   orthanc:
-    image: osimis/orthanc:24.4.0
+    image: orthancteam/orthanc
     container_name: orthanc
     environment:
-      # Default authentication for REST API
       ORTHANC__NAME: "Orthanc in Docker"
       ORTHANC__REGISTERED_USERS: |-
         {
           "orthanc": "orthanc"
         }
-      # Enable/disable remote access control etc. Basic defaults here
       ORTHANC__REMOTE_ACCESS_ALLOWED: "true"
     ports:
       - "8042:8042"  # HTTP REST API
       - "4242:4242"  # DICOM port
     volumes:
       - orthanc-storage:/var/lib/orthanc
+
+  triton:
+    image: nvcr.io/nvidia/tritonserver:24.05-py3
+    container_name: triton
+    command: tritonserver --model-repository=/models --backend-directory=/opt/tritonserver/backends --backend-config=python,shm-region-prefix-name=prefix1_
+    volumes:
+      - ./triton/model_repo:/models
 
 volumes:
   orthanc-storage:

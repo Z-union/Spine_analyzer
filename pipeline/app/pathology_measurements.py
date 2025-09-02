@@ -9,9 +9,10 @@ import logging
 from typing import Dict, List, Tuple, Optional, Union
 from scipy import ndimage
 from skimage import measure, morphology
-from config import settings
+from .config import settings
 
-logger = logging.getLogger(__name__)
+# Используем единый логгер из main
+logger = logging.getLogger("dicom-pipeline")
 
 
 class PathologyMeasurements:

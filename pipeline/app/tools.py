@@ -1,6 +1,6 @@
 import numpy as np
 import nibabel as nib
-from dicom_io import SpinalScan
+from .dicom_io import SpinalScan
 from skimage.transform import resize
 from typing import Union, List, Tuple
 

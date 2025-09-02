@@ -18,8 +18,8 @@ import tritonclient.grpc as grpcclient
 import os
 import matplotlib.pyplot as plt
 
-from config import settings
-from predictor import triton_inference
+from .config import settings
+from .predictor import triton_inference
 
 # Импорт модели
 try:
@@ -30,7 +30,8 @@ except ImportError:
     DualChannelGradingModel = None
     create_dual_channel_model = None
 
-logger = logging.getLogger(__name__)
+# Используем единый логгер из main
+logger = logging.getLogger("dicom-pipeline")
 
 class SpineGradingPipeline:
     def __init__(self, patch_size=(64, 128, 128), batch_size=4,

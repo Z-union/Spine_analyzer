@@ -5,7 +5,8 @@ from kafka import KafkaConsumer
 from .config import settings
 from .pipeline import run_pipeline_for_study
 
-logger = logging.getLogger(__name__)
+# Используем единый логгер из main
+logger = logging.getLogger("dicom-pipeline")
 
 executor = ThreadPoolExecutor(max_workers=settings.WORKERS)
 
