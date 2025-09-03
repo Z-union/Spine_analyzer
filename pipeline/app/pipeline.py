@@ -348,12 +348,22 @@ def process_study_path(path: str, client: grpcclient.InferenceServerClient, stud
                 
                 logger.info(f"Running sliding window inference for {step}")
                 try:
+                    # Use model-specific batch sizes from environment variables
+                    if model == 'seg_sag_stage_1':
+                        batch_size = settings.SEG_SAG_STAGE_1_BATCH_SIZE
+                    elif model == 'seg_sag_stage_2':
+                        batch_size = settings.SEG_SAG_STAGE_2_BATCH_SIZE
+                    else:
+                        batch_size = settings.INFERENCE_BATCH_SIZE
+                    
+                    logger.debug(f"Using batch_size={batch_size} for model {model}")
+                    
                     predicted_logits = sliding_window_inference(
                         data=img,
                         slicers=slicers,
                         patch_size=settings.SAG_PATCH_SIZE,
                         num_heads=num_segmentation_heads,
-                        batch_size=4,
+                        batch_size=batch_size,
                         use_gaussian=True,
                         mode="3d",
                         triton_client=client,

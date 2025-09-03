@@ -1,6 +1,6 @@
 name: "seg_sag_stage_1"
 platform: "onnxruntime_onnx"
-max_batch_size: 16
+max_batch_size: 1  # Single batch only to minimize memory usage
 
 input [
   {
@@ -22,23 +22,28 @@ instance_group [
   { kind: KIND_CPU, count: 1 }
 ]
 
-dynamic_batching {
-  preferred_batch_size: [4, 8]
-  max_queue_delay_microseconds: 1000
-}
-
-optimization {
-  execution_accelerators {
-    gpu_execution_accelerator {
-      name: "tensorrt"
-    }
-    gpu_execution_accelerator {
-      name: "trt_fp16"
-    }
-  }
-}
+# Disable dynamic batching to force single requests
+# dynamic_batching {
+#   preferred_batch_size: [1]
+#   max_queue_delay_microseconds: 10000
+# }
 
 parameters {
   key: "enable_memory_growth"
   value: { string_value: "true" }
+}
+
+parameters {
+  key: "intra_op_num_threads"
+  value: { string_value: "4" }
+}
+
+parameters {
+  key: "inter_op_num_threads"
+  value: { string_value: "2" }
+}
+
+parameters {
+  key: "execution_mode"
+  value: { string_value: "0" }
 }

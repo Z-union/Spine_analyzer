@@ -74,9 +74,11 @@ def triton_inference(
     model_name: str,
     input_name: str,
     output_names: Union[List[str], str],
+    max_retries: int = 3,
+    retry_delay: float = 1.0
 ) -> Union[Dict[str, np.ndarray], np.ndarray]:
     """
-    Send batch to Triton Inference Server via gRPC.
+    Send batch to Triton Inference Server via gRPC with retry logic.
     
     Args:
         batch_np: Input batch CxDxHxW or BxCxDxHxW
@@ -84,52 +86,84 @@ def triton_inference(
         model_name: Name of the model in Triton
         input_name: Name of the input tensor
         output_names: Output name (str) or list of output names
+        max_retries: Maximum number of retry attempts
+        retry_delay: Delay between retries in seconds
         
     Returns:
         np.ndarray if single output, dict {output_name: np.ndarray} otherwise
     """
+    import time
+    
     logger.debug(f"Triton inference request - model: {model_name}, input shape: {batch_np.shape}")
     
-    try:
-        if batch_np.ndim == 4:
-            batch_np = batch_np[None]  # Add batch dimension
-            logger.debug(f"Added batch dimension, new shape: {batch_np.shape}")
+    # Ensure we have the correct batch dimension
+    if batch_np.ndim == 4:
+        batch_np = batch_np[None]  # Add batch dimension: CxDxHxW -> 1xCxDxHxW
+        logger.debug(f"Added batch dimension, new shape: {batch_np.shape}")
+    elif batch_np.ndim == 5 and batch_np.shape[0] > 1:
+        # If batch size > 1, process only the first sample to comply with model constraints
+        batch_np = batch_np[:1]  # Take only first sample: BxCxDxHxW -> 1xCxDxHxW
+        logger.debug(f"Reduced batch size to 1, new shape: {batch_np.shape}")
 
-        batch_np = batch_np.astype(np.float32)
+    batch_np = batch_np.astype(np.float32)
 
-        # Convert output_names to list
-        if isinstance(output_names, str):
-            output_names = [output_names]
+    # Convert output_names to list
+    if isinstance(output_names, str):
+        output_names = [output_names]
 
-        # Prepare input
-        inputs = [grpcclient.InferInput(input_name, batch_np.shape, "FP32")]
-        inputs[0].set_data_from_numpy(batch_np)
+    # Prepare input
+    inputs = [grpcclient.InferInput(input_name, batch_np.shape, "FP32")]
+    inputs[0].set_data_from_numpy(batch_np)
 
-        # Prepare outputs
-        outputs = [grpcclient.InferRequestedOutput(name) for name in output_names]
+    # Prepare outputs
+    outputs = [grpcclient.InferRequestedOutput(name) for name in output_names]
 
-        logger.debug(f"Sending inference request to Triton for model {model_name}")
-        response = triton_client.infer(
-            model_name=model_name,
-            inputs=inputs,
-            outputs=outputs
-        )
-        
-        preds = {name: response.as_numpy(name) for name in output_names}
-        logger.debug(f"Inference successful, output shapes: {[{k: v.shape for k, v in preds.items()}]}")
-        
-        # Return np.ndarray if single output
-        if len(preds) == 1:
-            return next(iter(preds.values()))
-        return preds
-        
-    except InferenceServerException as e:
-        logger.error(f"Triton inference failed for model {model_name}: {str(e)}")
-        logger.debug(f"Failed inference details - input_shape: {batch_np.shape}, model: {model_name}")
-        raise RuntimeError(f"Triton inference failed: {e}")
-    except Exception as e:
-        logger.error(f"Unexpected error during Triton inference: {str(e)}")
-        raise
+    last_exception = None
+    for attempt in range(max_retries + 1):
+        try:
+            logger.debug(f"Sending inference request to Triton for model {model_name} (attempt {attempt + 1}/{max_retries + 1}), batch_size: {batch_np.shape[0]}")
+            
+            # Add timeout to prevent hanging
+            response = triton_client.infer(
+                model_name=model_name,
+                inputs=inputs,
+                outputs=outputs,
+                timeout=60  # 60 second timeout
+            )
+            
+            preds = {name: response.as_numpy(name) for name in output_names}
+            logger.debug(f"Inference successful, output shapes: {[{k: v.shape for k, v in preds.items()}]}")
+            
+            # Return np.ndarray if single output
+            if len(preds) == 1:
+                return next(iter(preds.values()))
+            return preds
+            
+        except InferenceServerException as e:
+            last_exception = e
+            error_msg = str(e)
+            logger.warning(f"Triton inference failed for model {model_name} (attempt {attempt + 1}/{max_retries + 1}): {error_msg}")
+            
+            # Check if it's a connection error that might be recoverable
+            if "Connection reset by peer" in error_msg or "UNAVAILABLE" in error_msg:
+                if attempt < max_retries:
+                    logger.info(f"Retrying in {retry_delay} seconds...")
+                    time.sleep(retry_delay)
+                    retry_delay *= 1.5  # Exponential backoff
+                    continue
+            
+            # For other errors, don't retry
+            break
+            
+        except Exception as e:
+            last_exception = e
+            logger.error(f"Unexpected error during Triton inference: {str(e)}")
+            break
+    
+    # If we get here, all retries failed
+    logger.error(f"All {max_retries + 1} attempts failed for model {model_name}")
+    logger.debug(f"Failed inference details - input_shape: {batch_np.shape}, model: {model_name}")
+    raise RuntimeError(f"Triton inference failed after {max_retries + 1} attempts: {last_exception}")
 
 
 def sliding_window_inference(
@@ -174,47 +208,37 @@ def sliding_window_inference(
         n_predictions = np.zeros(data.shape[1:], dtype=np.float16)
         gaussian_map = compute_gaussian(patch_size) if use_gaussian else 1.0
 
-        batch_patches, batch_slicers = [], []
-        total_batches = (len(slicers) + batch_size - 1) // batch_size
-        processed_batches = 0
-
+        # Process patches one by one to avoid batch size issues
         for i, sl in enumerate(slicers):
-            patch = data[sl][None]
+            patch = data[sl][None]  # Add batch dimension
             if mode == "2d" and patch.ndim == 5:
                 patch = patch.squeeze(2)
-            batch_patches.append(patch)
-            batch_slicers.append(sl)
-
-            if len(batch_patches) == batch_size or sl == slicers[-1]:
-                batch_tensor = np.concatenate(batch_patches, axis=0)
+            
+            logger.debug(f"Processing patch {i + 1}/{len(slicers)}, patch shape: {patch.shape}")
+            
+            try:
+                pred_patch = triton_inference(
+                    patch,
+                    triton_client,
+                    triton_model_name,
+                    triton_input_name,
+                    triton_output_name
+                )
                 
-                logger.debug(f"Processing batch {processed_batches + 1}/{total_batches}, "
-                           f"batch shape: {batch_tensor.shape}")
+                # Remove batch dimension
+                pred_patch = pred_patch[0]
                 
-                try:
-                    batch_pred = triton_inference(
-                        batch_tensor,
-                        triton_client,
-                        triton_model_name,
-                        triton_input_name,
-                        triton_output_name
-                    )
-                except Exception as e:
-                    logger.error(f"Inference failed at batch {processed_batches + 1}/{total_batches}: {str(e)}")
-                    raise
-
-                for b, sl_b in enumerate(batch_slicers):
-                    pred_patch = batch_pred[b]
-                    if use_gaussian:
-                        pred_patch = pred_patch * gaussian_map
-                    predicted_logits[sl_b] += pred_patch
-                    n_predictions[sl_b[1:]] += gaussian_map
-
-                batch_patches, batch_slicers = [], []
-                processed_batches += 1
+                if use_gaussian:
+                    pred_patch = pred_patch * gaussian_map
+                predicted_logits[sl] += pred_patch
+                n_predictions[sl[1:]] += gaussian_map
                 
-                if processed_batches % 10 == 0:
-                    logger.debug(f"Processed {processed_batches}/{total_batches} batches")
+                if (i + 1) % 10 == 0:
+                    logger.debug(f"Processed {i + 1}/{len(slicers)} patches")
+                    
+            except Exception as e:
+                logger.error(f"Inference failed at patch {i + 1}/{len(slicers)}: {str(e)}")
+                raise
 
         predicted_logits /= n_predictions
         

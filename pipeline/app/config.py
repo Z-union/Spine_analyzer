@@ -38,7 +38,13 @@ class Settings(BaseSettings):
     AX_PATCH_SIZE: Optional[list[int]] = [224, 224]
     DILATE_SIZE: int = 5
     CANAL_LABEL: int = 2
-    INFERENCE_BATCH_SIZE: int = 4
+    
+    # Batch sizes for different models
+    SEG_SAG_STAGE_1_BATCH_SIZE: int = 1
+    SEG_SAG_STAGE_2_BATCH_SIZE: int = 1
+    GRADING_BATCH_SIZE: int = 4
+    INFERENCE_BATCH_SIZE: int = 1  # General fallback
+    
     USE_GPU: bool = True
     
     # Performance Tuning

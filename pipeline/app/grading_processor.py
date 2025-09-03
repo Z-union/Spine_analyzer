@@ -498,7 +498,10 @@ class SpineGradingProcessor:
         }
 
         try:
-            self.slice_pipeline = SpineGradingPipeline(patch_size=(32, 112, 32), batch_size=4)
+            # Используем размер батча из переменных окружения
+            batch_size = settings.GRADING_BATCH_SIZE
+            self.slice_pipeline = SpineGradingPipeline(patch_size=(32, 112, 32), batch_size=batch_size)
+            logger.info(f"Инициализирован grading pipeline с batch_size={batch_size}")
 
         except Exception as e:
             self.slice_pipeline = None

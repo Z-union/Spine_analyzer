@@ -6,7 +6,7 @@ services:
     env_file:
       - .env
     ports:
-      - "8000:8000"
+      - "7998:8000"  # Changed to avoid conflict with Triton HTTP port
     depends_on:
       - orthanc
       - triton
@@ -30,9 +30,29 @@ services:
   triton:
     image: nvcr.io/nvidia/tritonserver:24.05-py3
     container_name: triton
-    command: tritonserver --model-repository=/models --backend-directory=/opt/tritonserver/backends --backend-config=python,shm-region-prefix-name=prefix1_
+    command: tritonserver --model-repository=/models --backend-directory=/opt/tritonserver/backends --backend-config=python,shm-region-prefix-name=prefix1_ --log-verbose=1 --exit-on-error=false --model-control-mode=explicit --load-model=seg_sag_stage_1 --load-model=seg_sag_stage_2 --load-model=grading
+    ports:
+      - "8001:8001"  # gRPC port
+      - "8000:8000"  # HTTP port
     volumes:
       - ./triton/model_repo:/models
+    deploy:
+      resources:
+        limits:
+          memory: 12G  # Increased memory limit
+        reservations:
+          memory: 6G   # Increased reservation
+    environment:
+      - CUDA_VISIBLE_DEVICES=""  # Force CPU-only mode to avoid GPU memory issues
+      - OMP_NUM_THREADS=4        # Limit OpenMP threads
+      - MKL_NUM_THREADS=4        # Limit MKL threads
+      - OPENBLAS_NUM_THREADS=4   # Limit OpenBLAS threads
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/v2/health/ready"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
 
 volumes:
   orthanc-storage:
