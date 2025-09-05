@@ -31,9 +31,9 @@ services:
     image: nvcr.io/nvidia/tritonserver:24.05-py3
     container_name: triton
     command: tritonserver --model-repository=/models --backend-directory=/opt/tritonserver/backends --backend-config=python,shm-region-prefix-name=prefix1_ --log-verbose=1 --exit-on-error=false --model-control-mode=explicit --load-model=seg_sag_stage_1 --load-model=seg_sag_stage_2 --load-model=grading
-    ports:
-      - "8001:8001"  # gRPC port
-      - "8000:8000"  # HTTP port
+    # ports:
+    #   - "8001:8001"  # gRPC port
+    #   - "8000:8000"  # HTTP port
     volumes:
       - ./triton/model_repo:/models
     deploy:
