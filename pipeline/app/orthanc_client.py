@@ -3,6 +3,10 @@ import tempfile
 import requests
 import logging
 from .config import settings
+from dicomweb_client.api import DICOMwebClient
+from requests.auth import HTTPBasicAuth
+from dicomweb_client.session_utils import create_session_from_auth
+
 
 logger = logging.getLogger("dicom-pipeline")
 
@@ -228,3 +232,9 @@ def list_all_studies() -> list:
         })
     
     return studies
+
+
+def get_dicomweb_client():
+    auth = HTTPBasicAuth(settings.ORTHANC_USER, settings.ORTHANC_PASSWORD)
+    session = create_session_from_auth(auth)
+    return DICOMwebClient(f"{settings.ORTHANC_URL}/dicom-web", session=session)

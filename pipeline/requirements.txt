@@ -16,3 +16,5 @@ pydicom
 dicomweb-client
 nibabel
 numpy
+python-docx
+dicomweb-client

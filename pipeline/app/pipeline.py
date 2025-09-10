@@ -566,7 +566,6 @@ def run_pipeline_for_study(study_id: str) -> Dict[str, Any]:
         client = grpcclient.InferenceServerClient(url=settings.TRITON_URL, verbose=False)
         tmp_path = fetch_study_temp(study_id)
         logger.info(f"Study {study_id} downloaded to temp: {tmp_path}")
-
         # Обработка исследования
         result = process_study_path(tmp_path, study_id=study_id, client=client)
         
@@ -578,6 +577,7 @@ def run_pipeline_for_study(study_id: str) -> Dict[str, Any]:
             pathology_measurements = result.get("pathology_measurements", {})
             segmentation_images = result.get("segmentations", [])
             
+            logger.info(f"segmentation_images: {segmentation_images}")
             # Отправляем отчеты в Orthanc
             try:
                 report_upload_result = send_reports_to_orthanc(
@@ -612,7 +612,8 @@ def run_pipeline_for_study(study_id: str) -> Dict[str, Any]:
             "study_id": study_id,
             "pipeline_result": result,
             "report_upload": report_upload_result
-        }
+        }, segmentation_images
+    
     except Exception:
         logger.exception(f"Pipeline failed for study {study_id}")
         

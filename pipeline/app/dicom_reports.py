@@ -1,6 +1,8 @@
 """
 Module for creating and uploading DICOM SR (Structured Report) and SC (Secondary Capture) to Orthanc
 """
+from fastapi import HTTPException
+import json
 import logging
 import io
 from typing import Dict, Any, List, Optional
@@ -15,6 +17,17 @@ from .config import settings
 
 # Используем единый логгер из main
 logger = logging.getLogger("dicom-pipeline")
+
+class ResourceNotFoundError(HTTPException):
+    def __init__(
+        self,
+        status_code: int = 404,
+        detail: str = "Requested resource doesn't exist",
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        super().__init__(status_code, detail, headers)
+        self.status_code = status_code
+        self.detail = detail
 
 
 class DICOMReportGenerator:
@@ -71,7 +84,39 @@ class DICOMReportGenerator:
         item.MeasuredValueSequence = [measured_value]
         
         return item
-        
+    
+    def _get_resource_uid(self, resourse: str, resource_id: str) -> str:
+        data = {
+            "Level": resourse,  # Study
+            "Query": {"StudyInstanceUID": resource_id},
+        }
+        uid = self.find(data)
+        if uid:
+            return uid[0]
+        else:
+            raise ResourceNotFoundError(detail="Requested resource doesn't exist")
+
+    def find(
+        self, search_params: dict, headers: dict[str, str] | None = None,
+    ) -> list[str | dict]:
+        if not headers:
+            headers = {"Content-Type": "application/json"}
+        # url = f"{self.protocol}://{self.host}:{self.port}/tools/find"
+            
+            response = requests.post(
+                self.orthanc_url,
+                auth=self.orthanc_auth,
+                data=json.dumps(search_params).encode(),
+                headers={'Content-Type': 'application/dicom'}
+            )
+            response.raise_for_status()
+            
+            result = response.json()
+            logger.info(f"Successfully get study id from orthanc: {result}")
+
+        return result
+
+
     def create_structured_report(self, 
                                 grading_results: Dict,
                                 pathology_measurements: Dict,
@@ -404,7 +449,8 @@ class DICOMReportGenerator:
             Study metadata dictionary
         """
         try:
-            url = f"{self.orthanc_url}/studies/{study_id}"
+            resource_id = self._get_resource_uid("Study", study_id)
+            url = f"{self.orthanc_url}/studies/{resource_id}"
             response = requests.get(url, auth=self.orthanc_auth)
             response.raise_for_status()
             
@@ -454,6 +500,7 @@ def send_reports_to_orthanc(study_id: str,
         
         # Get study metadata from Orthanc
         study_info = generator.get_study_metadata(study_id)
+        logger.info(f"study_info: {study_info}")
         generator.study_info = study_info
         
         results = {

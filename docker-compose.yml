@@ -8,24 +8,24 @@ services:
     ports:
       - "7998:8000"  # Changed to avoid conflict with Triton HTTP port
     depends_on:
-      - orthanc
+      # - orthanc
       - triton
 
-  orthanc:
-    image: orthancteam/orthanc
-    container_name: orthanc
-    environment:
-      ORTHANC__NAME: "Orthanc in Docker"
-      ORTHANC__REGISTERED_USERS: |-
-        {
-          "orthanc": "orthanc"
-        }
-      ORTHANC__REMOTE_ACCESS_ALLOWED: "true"
-    ports:
-      - "8042:8042"  # HTTP REST API
-      - "4242:4242"  # DICOM port
-    volumes:
-      - orthanc-storage:/var/lib/orthanc
+  # orthanc:
+  #   image: orthancteam/orthanc
+  #   container_name: orthanc
+  #   environment:
+  #     ORTHANC__NAME: "Orthanc in Docker"
+  #     ORTHANC__REGISTERED_USERS: |-
+  #       {
+  #         "orthanc": "orthanc"
+  #       }
+  #     ORTHANC__REMOTE_ACCESS_ALLOWED: "true"
+  #   ports:
+  #     - "8042:8042"  # HTTP REST API
+  #     - "4242:4242"  # DICOM port
+  #   volumes:
+  #     - orthanc-storage:/var/lib/orthanc
 
   triton:
     image: nvcr.io/nvidia/tritonserver:24.05-py3
