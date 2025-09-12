@@ -30,6 +30,37 @@ class ResourceNotFoundError(HTTPException):
         self.detail = detail
 
 
+def flatten_to_scalar(val):
+    """Recursively descend into nested lists or numpy arrays until a scalar is found.
+    Always returns native Python str, int, or float.
+    Converts all other types (including np.str_, np.int64, bool, None, dict) to str.
+    """
+    while isinstance(val, (list, np.ndarray)):
+        if isinstance(val, np.ndarray):
+            if val.ndim == 0:
+                val = val.item() 
+                break
+            if val.size == 0:
+                return ""
+            val = val[0]  
+        else:  # list
+            if len(val) == 0:
+                return ""
+            val = val[0]
+
+    if isinstance(val, np.number):
+        val = val.item()  
+    elif isinstance(val, np.str_):
+        val = str(val)   
+    elif isinstance(val, np.bool_):
+        val = bool(val)  
+
+    if isinstance(val, (int, float)):
+        return val
+    else:
+        return str(val)
+
+
 class DICOMReportGenerator:
     """Generator for DICOM SR and SC reports"""
     
@@ -104,7 +135,7 @@ class DICOMReportGenerator:
         # url = f"{self.protocol}://{self.host}:{self.port}/tools/find"
             
             response = requests.post(
-                self.orthanc_url,
+                f"{self.orthanc_url}/tools/find",
                 auth=self.orthanc_auth,
                 data=json.dumps(search_params).encode(),
                 headers={'Content-Type': 'application/dicom'}
@@ -115,6 +146,7 @@ class DICOMReportGenerator:
             logger.info(f"Successfully get study id from orthanc: {result}")
 
         return result
+
 
 
     def create_structured_report(self, 
@@ -213,11 +245,15 @@ class DICOMReportGenerator:
                     
                     # Add grading scores
                     for category, value in result['predictions'].items():
+                        safe_value = flatten_to_scalar(value)
+                        print(f"safe_value = {safe_value}, category = {category}, value = {value}, predictions = {result['predictions']}, \
+                              type_value = {type(value)}")
                         score_item = self._create_num_item(
-                            '121072', category, value,
+                            '121072', category, safe_value,
                             '1', 'UCUM', 'grade'
                         )
                         disk_content.append(score_item)
+
                     
                     # Add pathology measurements if available
                     if disk_label in pathology_measurements:
@@ -475,14 +511,16 @@ class DICOMReportGenerator:
             }
             
         except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to fetch study metadata from Orthanc: {e}")
+            logger.error(f"Failed to fetch study metadata from Orthanc for study {study_id}: {e}")
             return {}
 
 
-def send_reports_to_orthanc(study_id: str,
-                           grading_results: Dict,
-                           pathology_measurements: Dict,
-                           segmentation_images: List[np.ndarray]) -> Dict[str, Any]:
+def send_reports_to_orthanc(
+    study_id: str,
+    grading_results: Dict,
+    pathology_measurements: Dict,
+    segmentation_images: List[np.ndarray]
+) -> Dict[str, Any]:
     """
     Main function to create and send all reports to Orthanc
     
@@ -498,35 +536,46 @@ def send_reports_to_orthanc(study_id: str,
     try:
         generator = DICOMReportGenerator()
         
-        # Get study metadata from Orthanc
         study_info = generator.get_study_metadata(study_id)
         logger.info(f"study_info: {study_info}")
         generator.study_info = study_info
         
         results = {
             'study_id': study_id,
+            'sr_created': False,
             'sr_uploaded': False,
+            'sc_created': False,
             'sc_uploaded': False,
             'sc_count': 0,
             'errors': []
         }
-        
-        # Create and upload Structured Report
+
+        sr_data = None
         try:
             sr_data = generator.create_structured_report(
-                grading_results, 
+                grading_results,
                 pathology_measurements,
                 study_id
             )
-            sr_result = generator.upload_to_orthanc(sr_data, study_id)
-            results['sr_uploaded'] = True
-            results['sr_instance'] = sr_result.get('ID')
-            logger.info(f"SR uploaded successfully for study {study_id}")
+            results['sr_created'] = True
+            logger.info(f"SR created successfully for study {study_id}")
         except Exception as e:
-            logger.error(f"Failed to create/upload SR for study {study_id}: {e}")
-            results['errors'].append(f"SR upload failed: {str(e)}")
-        
-        # Create and upload Secondary Captures
+            error_msg = f"SR creation failed: {str(e)}"
+            logger.error(f"Failed to create SR for study {study_id}: {e}")
+            results['errors'].append(error_msg)
+
+        if sr_data:
+            try:
+                sr_result = generator.upload_to_orthanc(sr_data, study_id)
+                results['sr_uploaded'] = True
+                results['sr_instance'] = sr_result.get('ID')
+                logger.info(f"SR uploaded successfully for study {study_id}")
+            except Exception as e:
+                error_msg = f"SR upload failed: {str(e)}"
+                logger.error(f"Failed to upload SR for study {study_id}: {e}")
+                results['errors'].append(error_msg)
+
+        sc_files = []
         if segmentation_images:
             try:
                 sc_files = generator.create_secondary_capture(
@@ -534,25 +583,38 @@ def send_reports_to_orthanc(study_id: str,
                     study_id,
                     "Spine Segmentation with Pathology Overlay"
                 )
-                
-                for sc_data in sc_files:
-                    sc_result = generator.upload_to_orthanc(sc_data, study_id)
-                    results['sc_count'] += 1
-                
-                results['sc_uploaded'] = True
-                logger.info(f"Uploaded {results['sc_count']} SC images for study {study_id}")
-                
+                results['sc_created'] = True
+                logger.info(f"Created {len(sc_files)} SC files for study {study_id}")
             except Exception as e:
-                logger.error(f"Failed to create/upload SC for study {study_id}: {e}")
-                results['errors'].append(f"SC upload failed: {str(e)}")
-        
+                error_msg = f"SC creation failed: {str(e)}"
+                logger.error(f"Failed to create SC for study {study_id}: {e}")
+                results['errors'].append(error_msg)
+
+            if sc_files:
+                uploaded_count = 0
+                for i, sc_data in enumerate(sc_files):
+                    try:
+                        generator.upload_to_orthanc(sc_data, study_id)
+                        uploaded_count += 1
+                    except Exception as e:
+                        error_msg = f"SC upload failed for image {i+1}: {str(e)}"
+                        logger.error(f"Failed to upload SC image {i+1} for study {study_id}: {e}")
+                        results['errors'].append(error_msg)
+
+                results['sc_count'] = uploaded_count
+                if uploaded_count > 0:
+                    results['sc_uploaded'] = True
+                    logger.info(f"Uploaded {uploaded_count} SC images for study {study_id}")
+
         return results
-        
+
     except Exception as e:
-        logger.error(f"Failed to send reports to Orthanc for study {study_id}: {e}")
+        logger.error(f"Unexpected error in send_reports_to_orthanc for study {study_id}: {e}")
         return {
             'study_id': study_id,
+            'sr_created': False,
             'sr_uploaded': False,
+            'sc_created': False,
             'sc_uploaded': False,
-            'errors': [str(e)]
+            'errors': [f"Unexpected error: {str(e)}"]
         }

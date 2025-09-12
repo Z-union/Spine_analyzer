@@ -577,7 +577,7 @@ def run_pipeline_for_study(study_id: str) -> Dict[str, Any]:
             pathology_measurements = result.get("pathology_measurements", {})
             segmentation_images = result.get("segmentations", [])
             
-            logger.info(f"segmentation_images: {segmentation_images}")
+            # logger.info(f"segmentation_images: {segmentation_images}")
             # Отправляем отчеты в Orthanc
             try:
                 report_upload_result = send_reports_to_orthanc(

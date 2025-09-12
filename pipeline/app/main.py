@@ -143,7 +143,6 @@ async def process_study(study_id: str = Form(...), client: DICOMwebClient = Depe
             patient_info["study_date"] = f"{sdate[:4]}-{sdate[4:6]}-{sdate[6:8]}"
 
         # Extract disk data for report
-        print(segmentation_images[27], segmentation_images[28])
         disk_data = extract_disk_data_from_results(pipeline_result)
         report_filename = f"{processing_id}.docx"
         report_path = create_disk_report(disk_data, patient_info, segmentation_images[27], segmentation_images[28], output_filename=report_filename)
