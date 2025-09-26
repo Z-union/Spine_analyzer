@@ -229,14 +229,11 @@ def generate_overlay_variants(
             if M['m00'] > 0:
                 cx = int(M['m10'] / M['m00'])
                 cy = int(M['m01'] / M['m00'])
-                text = _get_vertebra_label(v)  # Используем анатомические названия
-                # Поворачиваем координаты для корректного размещения после поворота изображения
-                # При повороте на 90° против часовой: новые координаты (y, width-x)
-                new_cx = cy + 2
-                new_cy = a_img.shape[1] - cx - 2
-                cv2.putText(a_img, text, (new_cx, new_cy), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 2, cv2.LINE_AA)
-                cv2.putText(a_img, text, (new_cx, new_cy), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1,
-                            cv2.LINE_AA)
+                text = _get_vertebra_label(v)
+                cv2.putText(a_img, text, (cx, cy),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 2, cv2.LINE_AA)
+                cv2.putText(a_img, text, (cx, cy),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
 
         # Поворот на 90° против часовой стрелки
         a_img = _rotate_image_90_ccw(a_img)
@@ -260,13 +257,11 @@ def generate_overlay_variants(
             if M['m00'] > 0:
                 cx = int(M['m10'] / M['m00'])
                 cy = int(M['m01'] / M['m00'])
-                text = _get_vertebra_label(v)  # Используем анатомические названия
-                # Поворачиваем координаты для корректного размещения после поворота изображения
-                new_cx = cy + 2
-                new_cy = b_img.shape[1] - cx - 2
-                cv2.putText(b_img, text, (new_cx, new_cy), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 2, cv2.LINE_AA)
-                cv2.putText(b_img, text, (new_cx, new_cy), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1,
-                            cv2.LINE_AA)
+                text = _get_vertebra_label(v)
+                cv2.putText(a_img, text, (cx, cy),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 2, cv2.LINE_AA)
+                cv2.putText(a_img, text, (cx, cy),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
 
         # Поворот на 90° против часовой стрелки
         b_img = _rotate_image_90_ccw(b_img)
@@ -291,8 +286,18 @@ def generate_overlay_variants(
             if d in settings.LANDMARK_LABELS:
                 # Добавляем позвонки, смежные с диском
                 for v in present_vertebrae:
-                    if abs(v - d) <= 1:  # Позвонки рядом с диском
-                        involved_vertebrae.append(v)
+                    mask = (seg_slice == v).astype(np.uint8)
+                    if mask.sum() == 0:
+                        continue
+                    M = cv2.moments(mask)
+                    if M['m00'] > 0:
+                        cx = int(M['m10'] / M['m00'])
+                        cy = int(M['m01'] / M['m00'])
+                        text = _get_vertebra_label(v)
+                        cv2.putText(a_img, text, (cx, cy),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 2, cv2.LINE_AA)
+                        cv2.putText(a_img, text, (cx, cy),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
 
         for v in sorted(set(involved_vertebrae)):
             mask = (seg_slice == v).astype(np.uint8)

@@ -580,8 +580,9 @@ def send_reports_to_orthanc(
         if segmentation_images:
             try:
                 variant_map: List[Tuple[str, List[np.ndarray]]] = []
+
                 if isinstance(segmentation_images, dict):
-                    # Expecting keys like 'variant_a', 'variant_b', 'variant_c'
+                    # Варианты переданы словарём
                     for key in ['variant_a', 'variant_b', 'variant_c']:
                         if key in segmentation_images and segmentation_images[key]:
                             desc = {
@@ -590,8 +591,23 @@ def send_reports_to_orthanc(
                                 'variant_c': 'Spine Overlay C - Focused (Modic/Spondy + Pathologies)'
                             }.get(key, f'Spine Overlay {key}')
                             variant_map.append((desc, segmentation_images[key]))
+
+                elif isinstance(segmentation_images, list) and segmentation_images and isinstance(
+                        segmentation_images[0], list):
+                    # Варианты переданы списком списков [ [A], [B], [C] ]
+                    variant_labels = [
+                        "Spine Overlay A - Contours (Verts/Disks/Pathologies)",
+                        "Spine Overlay B - Filled (Verts/Disks/Pathologies)",
+                        "Spine Overlay C - Focused (Modic/Spondy + Pathologies)",
+                    ]
+                    for idx, imgs in enumerate(segmentation_images):
+                        if imgs:
+                            desc = variant_labels[idx] if idx < len(
+                                variant_labels) else f"Spine Overlay Variant {idx + 1}"
+                            variant_map.append((desc, imgs))
+
                 else:
-                    # Backward compatibility: single list of images
+                    # Старый случай — просто список картинок
                     variant_map.append(("Spine Segmentation with Pathology Overlay", segmentation_images))
 
                 for desc, imgs in variant_map:
