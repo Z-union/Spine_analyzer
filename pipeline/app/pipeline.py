@@ -4,12 +4,14 @@ import shutil
 import zipfile
 import tarfile
 import tempfile
+import nibabel as nib
 from typing import Any, Dict, Optional, Tuple, List
 from nibabel.nifti1 import Nifti1Image
 import numpy as np
 import tritonclient.grpc as grpcclient
 import pandas as pd
 import cv2
+import scipy.ndimage as ndi
 
 from .orthanc_client import fetch_study_temp
 from .config import settings
@@ -26,21 +28,319 @@ from .predictor import sliding_window_inference
 from .pathology_measurements import PathologyMeasurements
 from .dicom_reports import send_reports_to_orthanc
 
+# Color constants (BGR)
+GREEN = (0, 255, 0)
+YELLOW = (0, 255, 255)
+RED = (0, 0, 255)
+
+
+def _compute_protrusion_mask(seg3d: np.ndarray, disk_label: int, canal_label: int) -> np.ndarray:
+    """
+    Approximate protrusion/herniation mask for a given disk by morphological opening difference
+    and restricting to region toward the canal (if canal present).
+    Returns a boolean 3D mask.
+    """
+    disk_mask = (seg3d == disk_label)
+    if not np.any(disk_mask):
+        return np.zeros_like(seg3d, dtype=bool)
+
+    canal_mask = (seg3d == canal_label)
+
+    coords = np.argwhere(disk_mask)
+    if coords.size == 0:
+        return np.zeros_like(seg3d, dtype=bool)
+
+    zc = int(np.round(coords[:, 0].mean()))
+    z_from = max(0, zc - 2)
+    z_to = min(seg3d.shape[0], zc + 3)
+
+    protrusion = np.zeros_like(seg3d, dtype=bool)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+
+    for z in range(z_from, z_to):
+        disk_slice = disk_mask[z].astype(np.uint8)
+        if disk_slice.sum() == 0:
+            continue
+        normal_disk = cv2.morphologyEx(disk_slice, cv2.MORPH_OPEN, kernel)
+        protruding = (disk_slice.astype(bool) & (~normal_disk.astype(bool)))
+        if np.any(canal_mask[z]):
+            # keep as-is; optional: distance filter could be applied here
+            pass
+        protrusion[z] = protruding
+
+    return protrusion
+
+
+def _rotate_image_90_ccw(image):
+    """Поворот изображения на 90 градусов против часовой стрелки"""
+    return cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+
+def _get_vertebra_label(vertebra_id: int) -> str:
+    """Получение анатомического названия позвонка по его ID"""
+    vertebra_names = {
+        # Крестец
+        50: 'S1',
+        # Поясничные позвонки
+        45: 'L5', 44: 'L4', 43: 'L3', 42: 'L2', 41: 'L1',
+        # Грудные позвонки
+        32: 'Th12', 31: 'Th11', 30: 'Th10', 29: 'Th9', 28: 'Th8',
+        27: 'Th7', 26: 'Th6', 25: 'Th5', 24: 'Th4', 23: 'Th3',
+        22: 'Th2', 21: 'Th1',
+        # Шейные позвонки
+        18: 'C7', 17: 'C6', 16: 'C5', 15: 'C4', 14: 'C3',
+        13: 'C2', 12: 'C1'
+    }
+    return vertebra_names.get(vertebra_id, f'V{vertebra_id}')
+
+
+def _draw_transparent_mask(base_img, mask, color, alpha=0.3):
+    """Наложение полупрозрачной маски на изображение"""
+    overlay = base_img.copy()
+    contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        cv2.drawContours(overlay, contours, -1, color, thickness=cv2.FILLED)
+    return cv2.addWeighted(base_img, 1 - alpha, overlay, alpha, 0)
+
+
+def generate_overlay_variants(
+        image_nifti: Nifti1Image,
+        seg_nifti: Nifti1Image,
+        disk_results: Dict[int, Dict],
+        output_root: str = "overlays",
+        slice_axis: int = 0,
+        thickness: int = 1  # Уменьшена толщина линий
+) -> Dict[str, List[np.ndarray]]:
+    """
+    Generate three overlay variants and save to cleaned folders per run.
+
+    Variants
+      - variant_a: contours of vertebrae (green), disks (yellow), hernias+bulges (red)
+      - variant_b: filled regions for same classes with 30% transparency
+      - variant_c: contours; only vertebrae adjacent to discs with Modic and/or spondylolisthesis; only hernias+bulges
+
+    Returns dict {variant_key: [images...]}
+    """
+    # Clean/create directories
+    try:
+        if os.path.isdir(output_root):
+            for sub in ("variant_a", "variant_b", "variant_c"):
+                p = os.path.join(output_root, sub)
+                if os.path.isdir(p):
+                    shutil.rmtree(p, ignore_errors=True)
+        os.makedirs(os.path.join(output_root, "variant_a"), exist_ok=True)
+        os.makedirs(os.path.join(output_root, "variant_b"), exist_ok=True)
+        os.makedirs(os.path.join(output_root, "variant_c"), exist_ok=True)
+    except Exception as e:
+        logger.warning(f"Failed to prepare overlay output directories: {e}")
+
+    img3d = np.asanyarray(image_nifti.dataobj)
+    seg3d = np.asanyarray(seg_nifti.dataobj).astype(np.uint16)
+
+    # Identify masks
+    present_disks = [lbl for lbl in settings.LANDMARK_LABELS if np.any(seg3d == lbl)]
+    # Получаем позвонки (предполагаем, что они имеют метки от 11 до 50)
+    present_vertebrae = [lbl for lbl in range(11, 51) if np.any(seg3d == lbl)]
+
+    mask_disks3d = np.isin(seg3d, present_disks)
+    mask_vertebra3d = (seg3d >= 11) & (seg3d <= 50)
+
+    # Build pathology masks from grading results
+    positive_hernia_disk_ids = set()
+    positive_bulge_disk_ids = set()
+    positive_modic_or_spondy_disk_ids = set()
+    for disk_id, res in (disk_results or {}).items():
+        preds = res.get('predictions') if isinstance(res, dict) else None
+        if not isinstance(preds, dict):
+            continue
+        # Model categories are named exactly as in grading_processor.categories
+        if preds.get('Disc herniation', 0) > 0:
+            positive_hernia_disk_ids.add(int(disk_id))
+        if preds.get('Disc bulging', 0) > 0:
+            positive_bulge_disk_ids.add(int(disk_id))
+        if preds.get('Modic', 0) > 0 or preds.get('Spondylolisthesis', 0) > 0:
+            positive_modic_or_spondy_disk_ids.add(int(disk_id))
+
+    canal_label = settings.CANAL_LABEL
+
+    mask_patho3d = np.zeros_like(seg3d, dtype=bool)
+    for d in sorted(positive_hernia_disk_ids.union(positive_bulge_disk_ids)):
+        mask_patho3d |= _compute_protrusion_mask(seg3d, d, canal_label)
+
+    # Variant C vertebra filter: vertebra adjacent to the selected discs (dilation-intersection)
+    mask_vert_c_3d = np.zeros_like(seg3d, dtype=bool)
+    if positive_modic_or_spondy_disk_ids:
+        structure = np.ones((3, 9, 9), dtype=bool)  # more dilation in-plane
+        for d in sorted(positive_modic_or_spondy_disk_ids):
+            local = (seg3d == d)
+            if not np.any(local):
+                continue
+            local_dil = ndi.binary_dilation(local, structure=structure)
+            mask_vert_c_3d |= (local_dil & mask_vertebra3d)
+
+    # Iterate slices
+    num_slices = img3d.shape[slice_axis]
+    out_a, out_b, out_c = [], [], []
+
+    for i in range(num_slices):
+        if slice_axis == 0:
+            img_slice = img3d[i, :, :]
+            seg_slice = seg3d[i, :, :]
+            disks_slice = mask_disks3d[i, :, :]
+            verts_slice = mask_vertebra3d[i, :, :]
+            patho_slice = mask_patho3d[i, :, :]
+            vert_c_slice = mask_vert_c_3d[i, :, :]
+        elif slice_axis == 1:
+            img_slice = img3d[:, i, :]
+            seg_slice = seg3d[:, i, :]
+            disks_slice = mask_disks3d[:, i, :]
+            verts_slice = mask_vertebra3d[:, i, :]
+            patho_slice = mask_patho3d[:, i, :]
+            vert_c_slice = mask_vert_c_3d[:, i, :]
+        else:
+            img_slice = img3d[:, :, i]
+            seg_slice = seg3d[:, :, i]
+            disks_slice = mask_disks3d[:, :, i]
+            verts_slice = mask_vertebra3d[:, :, i]
+            patho_slice = mask_patho3d[:, :, i]
+            vert_c_slice = mask_vert_c_3d[:, :, i]
+
+        # Skip empty slice for all masks
+        if not (np.any(disks_slice) or np.any(verts_slice) or np.any(patho_slice) or np.any(vert_c_slice)):
+            continue
+
+        img_norm = ((img_slice - np.min(img_slice)) / (np.ptp(img_slice) + 1e-8) * 255).astype(np.uint8)
+        base = cv2.cvtColor(img_norm, cv2.COLOR_GRAY2BGR)
+
+        # Variant A: contours
+        a_img = base.copy()
+        for mask, color in ((verts_slice, GREEN), (disks_slice, YELLOW), (patho_slice, RED)):
+            if np.any(mask):
+                contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                if contours:
+                    cv2.drawContours(a_img, contours, -1, color, thickness)
+
+        # labels на позвонках (не дисках) для variant A
+        for v in present_vertebrae:
+            mask = (seg_slice == v).astype(np.uint8)
+            if mask.sum() == 0:
+                continue
+            M = cv2.moments(mask)
+            if M['m00'] > 0:
+                cx = int(M['m10'] / M['m00'])
+                cy = int(M['m01'] / M['m00'])
+                text = _get_vertebra_label(v)  # Используем анатомические названия
+                # Поворачиваем координаты для корректного размещения после поворота изображения
+                # При повороте на 90° против часовой: новые координаты (y, width-x)
+                new_cx = cy + 2
+                new_cy = a_img.shape[1] - cx - 2
+                cv2.putText(a_img, text, (new_cx, new_cy), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 2, cv2.LINE_AA)
+                cv2.putText(a_img, text, (new_cx, new_cy), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1,
+                            cv2.LINE_AA)
+
+        # Поворот на 90° против часовой стрелки
+        a_img = _rotate_image_90_ccw(a_img)
+        out_a.append(a_img)
+
+        # Variant B: filled with transparency
+        b_img = base.copy()
+        if np.any(verts_slice):
+            b_img = _draw_transparent_mask(b_img, verts_slice, GREEN, alpha=0.3)
+        if np.any(disks_slice):
+            b_img = _draw_transparent_mask(b_img, disks_slice, YELLOW, alpha=0.3)
+        if np.any(patho_slice):
+            b_img = _draw_transparent_mask(b_img, patho_slice, RED, alpha=0.3)
+
+        # labels на позвонках для variant B
+        for v in present_vertebrae:
+            mask = (seg_slice == v).astype(np.uint8)
+            if mask.sum() == 0:
+                continue
+            M = cv2.moments(mask)
+            if M['m00'] > 0:
+                cx = int(M['m10'] / M['m00'])
+                cy = int(M['m01'] / M['m00'])
+                text = _get_vertebra_label(v)  # Используем анатомические названия
+                # Поворачиваем координаты для корректного размещения после поворота изображения
+                new_cx = cy + 2
+                new_cy = b_img.shape[1] - cx - 2
+                cv2.putText(b_img, text, (new_cx, new_cy), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 2, cv2.LINE_AA)
+                cv2.putText(b_img, text, (new_cx, new_cy), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1,
+                            cv2.LINE_AA)
+
+        # Поворот на 90° против часовой стрелки
+        b_img = _rotate_image_90_ccw(b_img)
+        out_b.append(b_img)
+
+        # Variant C: contours; only selected verts and pathologies
+        c_img = base.copy()
+        if np.any(vert_c_slice):
+            contours, _ = cv2.findContours(vert_c_slice.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if contours:
+                cv2.drawContours(c_img, contours, -1, GREEN, thickness)
+        if np.any(patho_slice):
+            contours, _ = cv2.findContours(patho_slice.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if contours:
+                cv2.drawContours(c_img, contours, -1, RED, thickness)
+
+        # labels только для затронутых позвонков (не дисков)
+        involved_vertebrae = []
+        for d in positive_modic_or_spondy_disk_ids.union(positive_hernia_disk_ids).union(positive_bulge_disk_ids):
+            # Найдем позвонки, соседние с этими дисками
+            # Предполагаем, что диски имеют метки, соответствующие позвонкам выше и ниже
+            if d in settings.LANDMARK_LABELS:
+                # Добавляем позвонки, смежные с диском
+                for v in present_vertebrae:
+                    if abs(v - d) <= 1:  # Позвонки рядом с диском
+                        involved_vertebrae.append(v)
+
+        for v in sorted(set(involved_vertebrae)):
+            mask = (seg_slice == v).astype(np.uint8)
+            if mask.sum() == 0:
+                continue
+            M = cv2.moments(mask)
+            if M['m00'] > 0:
+                cx = int(M['m10'] / M['m00'])
+                cy = int(M['m01'] / M['m00'])
+                text = _get_vertebra_label(v)  # Используем анатомические названия
+                # Поворачиваем координаты для корректного размещения после поворота изображения
+                new_cx = cy + 2
+                new_cy = c_img.shape[1] - cx - 2
+                cv2.putText(c_img, text, (new_cx, new_cy), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 2, cv2.LINE_AA)
+                cv2.putText(c_img, text, (new_cx, new_cy), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1,
+                            cv2.LINE_AA)
+
+        # Поворот на 90° против часовой стрелки
+        c_img = _rotate_image_90_ccw(c_img)
+        out_c.append(c_img)
+
+        # Save (уже повернутые изображения)
+        cv2.imwrite(os.path.join(output_root, 'variant_a', f'slice_{i:03d}.png'), a_img)
+        cv2.imwrite(os.path.join(output_root, 'variant_b', f'slice_{i:03d}.png'), b_img)
+        cv2.imwrite(os.path.join(output_root, 'variant_c', f'slice_{i:03d}.png'), c_img)
+
+    logger.info(f"Overlay variants created: A={len(out_a)}, B={len(out_b)}, C={len(out_c)}")
+    return {
+        'variant_a': out_a,
+        'variant_b': out_b,
+        'variant_c': out_c,
+    }
+
 # Используем единый логгер из main
 logger = logging.getLogger("dicom-pipeline")
 
 
 def save_segmentation_overlay_multiclass(
-    image_nifti: Nifti1Image,
-    seg_nifti: Nifti1Image,
-    output_dir: Optional[str] = None,
-    slice_axis: int = 0,
-    thickness: int = 1,
-    colormap: dict = None
+        image_nifti: Nifti1Image,
+        seg_nifti: Nifti1Image,
+        output_dir: Optional[str] = None,
+        slice_axis: int = 0,
+        thickness: int = 1,
+        colormap: dict = None
 ):
     """
     Save image slices with multiclass segmentation overlay as contours.
-    
+
     Parameters
     ----------
     image_nifti : nib.Nifti1Image
@@ -55,35 +355,36 @@ def save_segmentation_overlay_multiclass(
         Contour thickness
     colormap : dict, optional
         Dictionary {label: (B, G, R)} for colors. If None - random colors generated
-        
+
     Returns
     -------
     list
         List of overlay images as numpy arrays
     """
     results = []
-    
+
     try:
+        # Правильное извлечение данных из NIfTI объектов
         image_data = np.asanyarray(image_nifti.dataobj)
         seg_data = np.asanyarray(seg_nifti.dataobj).astype(np.uint8)
-        
+
         num_slices = image_data.shape[slice_axis]
         logger.debug(f"Creating segmentation overlays for {num_slices} slices")
-        
+
         # Generate colors for classes
         labels = np.unique(seg_data)
         labels = labels[labels != 0]  # exclude background
         if colormap is None:
             np.random.seed(42)
             colormap = {label: tuple(np.random.randint(0, 256, size=3).tolist()) for label in labels}
-        
+
         logger.debug(f"Found {len(labels)} unique labels for overlay: {labels.tolist()}")
-        
+
         # Create output directory if specified
         if output_dir is not None:
             os.makedirs(output_dir, exist_ok=True)
             logger.debug(f"Saving overlays to directory: {output_dir}")
-        
+
         for i in range(num_slices):
             # Select slice
             if slice_axis == 0:
@@ -95,15 +396,15 @@ def save_segmentation_overlay_multiclass(
             else:
                 img_slice = image_data[:, :, i]
                 seg_slice = seg_data[:, :, i]
-            
+
             # Skip empty slices
             if np.sum(seg_slice) == 0:
                 continue
-            
+
             # Normalize image for display
             img_norm = ((img_slice - np.min(img_slice)) / (np.ptp(img_slice) + 1e-8) * 255).astype(np.uint8)
             img_color = cv2.cvtColor(img_norm, cv2.COLOR_GRAY2BGR)
-            
+
             # Draw contours for each class
             for label, color in colormap.items():
                 mask = (seg_slice == label).astype(np.uint8)
@@ -111,17 +412,17 @@ def save_segmentation_overlay_multiclass(
                     continue
                 contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                 cv2.drawContours(img_color, contours, -1, color, thickness)
-            
+
             results.append(img_color)
-            
+
             # Save slice if output directory specified
             if output_dir is not None:
                 output_path = os.path.join(output_dir, f"slice_{i:03d}.png")
                 cv2.imwrite(output_path, img_color)
-        
+
         logger.info(f"Created {len(results)} segmentation overlay images")
         return results
-        
+
     except Exception as e:
         logger.error(f"Failed to create segmentation overlays: {str(e)}")
         return []
@@ -300,6 +601,8 @@ def process_study_path(path: str, client: grpcclient.InferenceServerClient, stud
 
         # Step 6: Select best scan
         logger.info("Step 6: Selecting best scan for segmentation")
+
+        logger.info(f"T1: {sag_scans[0].get_fdata().shape} T2: {sag_scans[1].get_fdata().shape}")
         sag_scan = _pick_best_scan(sag_scans)
         ax_scan = _pick_best_scan(ax_scans)
         
@@ -443,12 +746,29 @@ def process_study_path(path: str, client: grpcclient.InferenceServerClient, stud
                     multi_channel = np.stack([img_data, seg_data], axis=0)
                     nifti_img = Nifti1Image(multi_channel, nifti_img.affine, nifti_img.header)
 
+
         nifti_seg = iterative_label.transform_seg2image(_pick_best_scan(sag_scans), nifti_seg)
+
+        # nib.save(_pick_best_scan(sag_scans), "image.nii.gz")
+        # nib.save(nifti_seg, "segmentation.nii.gz")
+
         unique_labels = np.unique(nifti_seg.get_fdata())
         present_disks = [label for label in settings.LANDMARK_LABELS if label in unique_labels]
 
-        img_data = [img.get_fdata() if hasattr(img, 'get_fdata') else None for img in sag_scans]
-        img_data = img_data[:-1]
+        if isinstance(sag_scans, list):
+            img_data = [img.get_fdata() if hasattr(img, 'get_fdata') else None for img in sag_scans]
+        else:
+            img_data = sag_scans.get_fdata() if hasattr(sag_scans, 'get_fdata') else None
+
+        # Normalize channels: prefer first two channels (T1, T2) if three provided
+        if isinstance(img_data, list):
+            if len(img_data) >= 3:
+                # drop possible third channel (e.g., STIR)
+                img_data = img_data[:2]
+        else:
+            # ensure a list of channels for downstream code
+            img_data = [img_data]
+
         example = next(arr for arr in img_data if arr is not None)
         img_data = [arr if arr is not None else np.zeros_like(example) for arr in img_data]
         seg_data = np.asanyarray(nifti_seg.dataobj)
@@ -526,6 +846,18 @@ def process_study_path(path: str, client: grpcclient.InferenceServerClient, stud
                     logger.error(f"Ошибка при измерении патологий: {e}")
                 pathology_measurements = {"error": str(e)}
 
+        # DEBUG_MODE=True
+        #
+        # if pathology_measurements:
+        #     debug_dir = "debug_visualization" if DEBUG_MODE else None
+        #
+        #     # Получаем расширенную сегментацию
+        #     image_nifti, enhanced_seg_nifti = save_segmentation_with_pathologies(
+        #         image_nifti=nifti_img,
+        #         seg_nifti=seg_nifti,
+        #         debug=DEBUG_MODE  # Сохраняем файлы только в debug режиме
+        #     )
+
 
         present_counts = {
             "sagittal": sum(s is not None for s in scans[0]),
@@ -533,7 +865,16 @@ def process_study_path(path: str, client: grpcclient.InferenceServerClient, stud
             "coronal": sum(s is not None for s in scans[2]),
         }
 
-        segmentations = save_segmentation_overlay_multiclass(_pick_best_scan(sag_scans), nifti_seg)
+        # Create and save three overlay variants, and return them for SC creation
+        overlay_variants = generate_overlay_variants(
+            image_nifti=_pick_best_scan(sag_scans),
+            seg_nifti=nifti_seg,
+            disk_results=disk_results,
+            output_root="overlays",
+            slice_axis=0,
+            thickness=2
+        )
+
         return {
             "input_type": "file" if is_file else "dir",
             "archive_extracted_to": study_dir if temp_dir else None,
@@ -541,7 +882,7 @@ def process_study_path(path: str, client: grpcclient.InferenceServerClient, stud
             "series_detected": present_counts,
             "correspondence_pairs": len(correspondence),
             "results": df.to_json(orient="records", indent=2),
-            "segmentations": segmentations,
+            "segmentations": overlay_variants,
             "disk_results": disk_results,
             "pathology_measurements": pathology_measurements
         }

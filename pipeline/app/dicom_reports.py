@@ -5,7 +5,7 @@ from fastapi import HTTPException
 import json
 import logging
 import io
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime
 import numpy as np
 import cv2
@@ -519,7 +519,7 @@ def send_reports_to_orthanc(
     study_id: str,
     grading_results: Dict,
     pathology_measurements: Dict,
-    segmentation_images: List[np.ndarray]
+    segmentation_images: Any
 ) -> Dict[str, Any]:
     """
     Main function to create and send all reports to Orthanc
@@ -575,36 +575,52 @@ def send_reports_to_orthanc(
                 logger.error(f"Failed to upload SR for study {study_id}: {e}")
                 results['errors'].append(error_msg)
 
-        sc_files = []
+        # Handle one or multiple overlay variants
+        total_uploaded = 0
         if segmentation_images:
             try:
-                sc_files = generator.create_secondary_capture(
-                    segmentation_images,
-                    study_id,
-                    "Spine Segmentation with Pathology Overlay"
-                )
-                results['sc_created'] = True
-                logger.info(f"Created {len(sc_files)} SC files for study {study_id}")
+                variant_map: List[Tuple[str, List[np.ndarray]]] = []
+                if isinstance(segmentation_images, dict):
+                    # Expecting keys like 'variant_a', 'variant_b', 'variant_c'
+                    for key in ['variant_a', 'variant_b', 'variant_c']:
+                        if key in segmentation_images and segmentation_images[key]:
+                            desc = {
+                                'variant_a': 'Spine Overlay A - Contours (Verts/Disks/Pathologies)',
+                                'variant_b': 'Spine Overlay B - Filled (Verts/Disks/Pathologies)',
+                                'variant_c': 'Spine Overlay C - Focused (Modic/Spondy + Pathologies)'
+                            }.get(key, f'Spine Overlay {key}')
+                            variant_map.append((desc, segmentation_images[key]))
+                else:
+                    # Backward compatibility: single list of images
+                    variant_map.append(("Spine Segmentation with Pathology Overlay", segmentation_images))
+
+                for desc, imgs in variant_map:
+                    if not imgs:
+                        continue
+                    sc_files = generator.create_secondary_capture(imgs, study_id, desc)
+                    results.setdefault('sc_series', []).append({'description': desc, 'count': len(sc_files)})
+
+                    uploaded_count = 0
+                    for i, sc_data in enumerate(sc_files):
+                        try:
+                            generator.upload_to_orthanc(sc_data, study_id)
+                            uploaded_count += 1
+                        except Exception as e:
+                            error_msg = f"SC upload failed ({desc}) for image {i+1}: {str(e)}"
+                            logger.error(f"Failed to upload SC image {i+1} for study {study_id} [{desc}]: {e}")
+                            results['errors'].append(error_msg)
+
+                    total_uploaded += uploaded_count
+
+                results['sc_count'] = total_uploaded
+                results['sc_created'] = total_uploaded > 0
+                results['sc_uploaded'] = total_uploaded > 0
+                if total_uploaded > 0:
+                    logger.info(f"Uploaded {total_uploaded} SC images across {len(variant_map)} series for study {study_id}")
             except Exception as e:
-                error_msg = f"SC creation failed: {str(e)}"
-                logger.error(f"Failed to create SC for study {study_id}: {e}")
+                error_msg = f"SC creation/upload failed: {str(e)}"
+                logger.error(f"Failed to create/upload SC for study {study_id}: {e}")
                 results['errors'].append(error_msg)
-
-            if sc_files:
-                uploaded_count = 0
-                for i, sc_data in enumerate(sc_files):
-                    try:
-                        generator.upload_to_orthanc(sc_data, study_id)
-                        uploaded_count += 1
-                    except Exception as e:
-                        error_msg = f"SC upload failed for image {i+1}: {str(e)}"
-                        logger.error(f"Failed to upload SC image {i+1} for study {study_id}: {e}")
-                        results['errors'].append(error_msg)
-
-                results['sc_count'] = uploaded_count
-                if uploaded_count > 0:
-                    results['sc_uploaded'] = True
-                    logger.info(f"Uploaded {uploaded_count} SC images for study {study_id}")
 
         return results
 

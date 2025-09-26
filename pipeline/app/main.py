@@ -145,7 +145,15 @@ async def process_study(study_id: str = Form(...), client: DICOMwebClient = Depe
         # Extract disk data for report
         disk_data = extract_disk_data_from_results(pipeline_result)
         report_filename = f"{processing_id}.docx"
-        report_path = create_disk_report(disk_data, patient_info, segmentation_images[27], segmentation_images[28], output_filename=report_filename)
+        # Handle both legacy list and new variants dict for segmentation_images
+        if isinstance(segmentation_images, dict):
+            imgs = segmentation_images.get('variant_a') or next((v for k, v in segmentation_images.items() if isinstance(v, list) and v), [])
+        else:
+            imgs = segmentation_images or []
+        idx1, idx2 = 27, 28
+        img1 = imgs[idx1] if isinstance(imgs, list) and len(imgs) > idx1 else (imgs[-2] if isinstance(imgs, list) and len(imgs) >= 2 else None)
+        img2 = imgs[idx2] if isinstance(imgs, list) and len(imgs) > idx2 else (imgs[-1] if isinstance(imgs, list) and len(imgs) >= 1 else None)
+        report_path = create_disk_report(disk_data, patient_info, img1, img2, output_filename=report_filename)
 
         # Save to database
         save_processing_result(
