@@ -516,10 +516,10 @@ def _pick_best_scan(scan_tuple):
     Выбирает лучший доступный скан из кортежа (T1, T2, STIR).
     Приоритет: T1 > T2 > STIR
     """
-    if scan_tuple[0] is not None:  # T1
-        return scan_tuple[0]
     if scan_tuple[1] is not None:  # T2
         return scan_tuple[1]
+    if scan_tuple[0] is not None:  # T1
+        return scan_tuple[0]
     if scan_tuple[2] is not None:  # STIR
         return scan_tuple[2]
     return None

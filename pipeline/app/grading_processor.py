@@ -538,6 +538,8 @@ class SpineGradingProcessor:
                 raise RuntimeError("slice_pipeline не инициализирован")
 
             # Готовим многоканальные данные (C, D, H, W)
+            if t1_data.shape != t2_data.shape:
+                t1_data = np.zeros_like(t2_data)
             mri_2ch = np.stack([t1_data, t2_data], axis=0)
 
             mri_2ch = np.rot90(np.transpose(mri_2ch, (0, 3, 2, 1)), k=2, axes=(1, 2))
