@@ -258,9 +258,9 @@ def generate_overlay_variants(
                 cx = int(M['m10'] / M['m00'])
                 cy = int(M['m01'] / M['m00'])
                 text = _get_vertebra_label(v)
-                cv2.putText(a_img, text, (cx, cy),
+                cv2.putText(b_img, text, (cx, cy),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 2, cv2.LINE_AA)
-                cv2.putText(a_img, text, (cx, cy),
+                cv2.putText(b_img, text, (cx, cy),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
 
         # Поворот на 90° против часовой стрелки
@@ -294,9 +294,9 @@ def generate_overlay_variants(
                         cx = int(M['m10'] / M['m00'])
                         cy = int(M['m01'] / M['m00'])
                         text = _get_vertebra_label(v)
-                        cv2.putText(a_img, text, (cx, cy),
+                        cv2.putText(c_img, text, (cx, cy),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 2, cv2.LINE_AA)
-                        cv2.putText(a_img, text, (cx, cy),
+                        cv2.putText(c_img, text, (cx, cy),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
 
         for v in sorted(set(involved_vertebrae)):
