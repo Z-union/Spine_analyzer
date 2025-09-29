@@ -12,6 +12,7 @@ import cv2
 from pydicom.dataset import Dataset, FileDataset
 from pydicom.uid import generate_uid, ExplicitVRLittleEndian
 import requests
+from pydicom import dcmread
 
 from .config import settings
 

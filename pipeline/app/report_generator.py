@@ -194,7 +194,7 @@ def create_disk_report(disk_data, patient_info, seg_sagittal=None, seg_axial=Non
         if seg_sagittal.ndim == 3 and seg_sagittal.shape[0] == 3:
             seg_sagittal = np.transpose(seg_sagittal, (1, 2, 0))
         # Flip 180 degrees
-        seg_sagittal = np.rot90(seg_sagittal, k=5)
+        # seg_sagittal = np.rot90(seg_sagittal, k=5)
 
         with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmpfile:
             plt.figure(figsize=(6, 4))
@@ -219,7 +219,7 @@ def create_disk_report(disk_data, patient_info, seg_sagittal=None, seg_axial=Non
         if seg_axial.ndim == 3 and seg_axial.shape[0] == 3:
             seg_axial = np.transpose(seg_axial, (1, 2, 0))
         # Flip 180 degrees
-        seg_axial = np.rot90(seg_axial, k=5)
+        # seg_axial = np.rot90(seg_axial, k=5)
 
         with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmpfile:
             plt.figure(figsize=(6, 4))

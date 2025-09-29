@@ -784,6 +784,8 @@ def process_study_path(path: str, client: grpcclient.InferenceServerClient, stud
         grading_summary = processor.create_summary(disk_results)
 
         pathology_measurements = {}
+        logger.info(f"Disk results are: {disk_results}")
+        logger.info(f"Grading summary is: {grading_summary}")
         if disk_results and 'error' not in grading_summary:
             logger.info("Starting pathology measurements")
 
