@@ -1019,6 +1019,9 @@ def process_study_path(path: str, client: grpcclient.InferenceServerClient, stud
         preprocessor = DefaultPreprocessor()
         nifti_img = None
         nifti_seg = None
+        # Инициализируем переменные для передачи в send_reports_to_orthanc
+        final_nifti_seg = None
+        final_reference_image = None
 
         # Step 7: Segmentation
         if sag_scan is not None:
@@ -1175,7 +1178,11 @@ def process_study_path(path: str, client: grpcclient.InferenceServerClient, stud
 
         nifti_seg = iterative_label.transform_seg2image(_pick_best_scan(sag_scans), nifti_seg)
 
-        # Сохраняем финальную сегментацию в debug режиме
+        # Сохраняем финальные переменные для передачи в send_reports_to_orthanc
+        final_nifti_seg = nifti_seg
+        final_reference_image = _pick_best_scan(sag_scans)
+
+        # Сохраняем финальную сегментацию в debug ре��име
         if settings.DEBUG_MODE:
             save_debug_segmentation_overlays(
                 image_nifti=_pick_best_scan(sag_scans),
@@ -1335,7 +1342,9 @@ def process_study_path(path: str, client: grpcclient.InferenceServerClient, stud
             "results": df.to_json(orient="records", indent=2),
             "segmentations": overlay_variants,
             "disk_results": disk_results,
-            "pathology_measurements": pathology_measurements
+            "pathology_measurements": pathology_measurements,
+            "final_nifti_seg": final_nifti_seg,
+            "final_reference_image": final_reference_image
         }
     finally:
         # Clean up only the extraction dir we created here (not the downloaded tmp archive)
@@ -1368,21 +1377,20 @@ def run_pipeline_for_study(study_id: str) -> Dict[str, Any]:
             grading_results = result.get("disk_results", {})
             pathology_measurements = result.get("pathology_measurements", {})
             segmentation_images = result.get("segmentations", [])
+            final_nifti_seg = result.get("final_nifti_seg")
+            final_reference_image = result.get("final_reference_image")
             
             # logger.info(f"segmentation_images: {segmentation_images}")
             # Отправляем отчеты в Orthanc
             try:
-                # Получаем данные сегментации для DICOM Segmentation Object
-                segmentation_nifti = nifti_seg if 'nifti_seg' in locals() else None
-                reference_image_nifti = _pick_best_scan(sag_scans) if 'sag_scans' in locals() else None
-                
+                # Используем сохраненные пер��менные для DICOM Segmentation Object
                 report_upload_result = send_reports_to_orthanc(
                     study_id=study_id,
                     grading_results=grading_results,
                     pathology_measurements=pathology_measurements,
                     segmentation_images=segmentation_images,
-                    segmentation_nifti=segmentation_nifti,
-                    reference_image_nifti=reference_image_nifti
+                    segmentation_nifti=final_nifti_seg,
+                    reference_image_nifti=final_reference_image
                 )
                 logger.info(f"Reports uploaded to Orthanc for study {study_id}: {report_upload_result}")
             except Exception as e:
