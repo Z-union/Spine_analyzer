@@ -329,7 +329,224 @@ class DICOMReportGenerator:
             file_ds.save_as(buffer, write_like_original=False)
             return buffer.getvalue()
     
+    def create_enhanced_segmentation_object(self,
+                                          segmentation_data: np.ndarray,
+                                          reference_image_nifti,
+                                          study_id: str,
+                                          grading_results: Dict = None,
+                                          series_description: str = "AI Spine Segmentation") -> bytes:
+        """
+        Create DICOM Segmentation Object with pathological areas included
+        
+        Args:
+            segmentation_data: 3D numpy array with segmentation labels
+            reference_image_nifti: Reference NIfTI image for spatial information
+            study_id: Orthanc study ID
+            grading_results: Grading results to identify pathological areas
+            series_description: Description for the segmentation series
+            
+        Returns:
+            DICOM Segmentation Object as bytes
+        """
+        try:
+            # Create enhanced segmentation that includes pathological areas
+            enhanced_seg_data = segmentation_data.copy()
+            
+            # Add pathological areas if grading results are provided
+            if grading_results:
+                from .config import settings
+                
+                # Find pathological disks
+                pathological_disks = set()
+                for disk_id, res in grading_results.items():
+                    preds = res.get('predictions') if isinstance(res, dict) else None
+                    if not isinstance(preds, dict):
+                        continue
+                        
+                    # Check for herniation
+                    hernia_val = preds.get('Disc herniation', 0)
+                    if isinstance(hernia_val, list):
+                        hernia_val = hernia_val[0] if len(hernia_val) > 0 else 0
+                    if hernia_val > 0:
+                        pathological_disks.add(int(disk_id))
+                        
+                    # Check for bulging
+                    bulge_val = preds.get('Disc bulging', 0)
+                    if isinstance(bulge_val, list):
+                        bulge_val = bulge_val[0] if len(bulge_val) > 0 else 0
+                    if bulge_val > 0:
+                        pathological_disks.add(int(disk_id))
+                
+                # Compute pathological masks and add them to segmentation
+                if pathological_disks:
+                    canal_label = settings.CANAL_LABEL
+                    pathology_label = 999  # Special label for pathological areas
+                    
+                    logger.info(f"Adding pathological areas for disks: {sorted(pathological_disks)}")
+                    
+                    for disk_id in pathological_disks:
+                        protrusion_mask = self._compute_protrusion_mask(enhanced_seg_data, disk_id, canal_label)
+                        if np.any(protrusion_mask):
+                            enhanced_seg_data[protrusion_mask] = pathology_label
+                            logger.info(f"Added {np.sum(protrusion_mask)} pathological voxels for disk {disk_id}")
+            
+            return self._create_segmentation_dicom(enhanced_seg_data, reference_image_nifti, study_id, series_description)
+            
+        except Exception as e:
+            logger.error(f"Failed to create enhanced DICOM Segmentation Object: {e}")
+            raise
+
+    def _compute_protrusion_mask(self, seg3d: np.ndarray, disk_label: int, canal_label: int) -> np.ndarray:
+        """
+        Compute protrusion mask for a specific disk (copied from pipeline.py)
+        """
+        disk_mask = (seg3d == disk_label)
+        if not np.any(disk_mask):
+            return np.zeros_like(seg3d, dtype=bool)
+
+        canal_mask = (seg3d == canal_label)
+        if not np.any(canal_mask):
+            logger.debug(f"No canal found for disk {disk_label}, using simple morphological approach")
+            return self._simple_protrusion_mask(seg3d, disk_label)
+
+        coords = np.argwhere(disk_mask)
+        if coords.size == 0:
+            return np.zeros_like(seg3d, dtype=bool)
+
+        # Define region of interest around the disk
+        zc = int(np.round(coords[:, 0].mean()))
+        z_from = max(0, zc - 3)
+        z_to = min(seg3d.shape[0], zc + 4)
+
+        protrusion = np.zeros_like(seg3d, dtype=bool)
+        
+        for z in range(z_from, z_to):
+            disk_slice = disk_mask[z].astype(np.uint8)
+            canal_slice = canal_mask[z].astype(np.uint8)
+            
+            if disk_slice.sum() == 0:
+                continue
+                
+            # Find canal-directed protrusions
+            slice_protrusion = self._find_canal_directed_protrusions(disk_slice, canal_slice)
+            protrusion[z] = slice_protrusion
+
+        return protrusion
+
+    def _simple_protrusion_mask(self, seg3d: np.ndarray, disk_label: int) -> np.ndarray:
+        """
+        Simple protrusion detection without canal information (fallback)
+        """
+        disk_mask = (seg3d == disk_label)
+        coords = np.argwhere(disk_mask)
+        if coords.size == 0:
+            return np.zeros_like(seg3d, dtype=bool)
+
+        zc = int(np.round(coords[:, 0].mean()))
+        z_from = max(0, zc - 2)
+        z_to = min(seg3d.shape[0], zc + 3)
+
+        protrusion = np.zeros_like(seg3d, dtype=bool)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+
+        for z in range(z_from, z_to):
+            disk_slice = disk_mask[z].astype(np.uint8)
+            if disk_slice.sum() == 0:
+                continue
+            normal_disk = cv2.morphologyEx(disk_slice, cv2.MORPH_OPEN, kernel)
+            protruding = (disk_slice.astype(bool) & (~normal_disk.astype(bool)))
+            
+            # Remove small artifacts
+            if np.sum(protruding) > 10:  # minimum protrusion size
+                protrusion[z] = protruding
+
+        return protrusion
+
+    def _find_canal_directed_protrusions(self, disk_slice: np.ndarray, canal_slice: np.ndarray) -> np.ndarray:
+        """
+        Find disk parts that protrude toward the canal
+        """
+        if disk_slice.sum() == 0 or canal_slice.sum() == 0:
+            return np.zeros_like(disk_slice, dtype=bool)
+        
+        # Find centers of mass for disk and canal
+        disk_moments = cv2.moments(disk_slice)
+        canal_moments = cv2.moments(canal_slice)
+        
+        if disk_moments['m00'] == 0 or canal_moments['m00'] == 0:
+            return np.zeros_like(disk_slice, dtype=bool)
+        
+        disk_center = (int(disk_moments['m10'] / disk_moments['m00']), 
+                       int(disk_moments['m01'] / disk_moments['m00']))
+        canal_center = (int(canal_moments['m10'] / canal_moments['m00']), 
+                        int(canal_moments['m01'] / canal_moments['m00']))
+        
+        # Calculate direction from disk to canal
+        direction = np.array([canal_center[0] - disk_center[0], 
+                             canal_center[1] - disk_center[1]])
+        
+        if np.linalg.norm(direction) == 0:
+            return np.zeros_like(disk_slice, dtype=bool)
+        
+        direction = direction / np.linalg.norm(direction)
+        
+        # Create "normal" disk shape using erosion + dilation
+        kernel_size = 5
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+        
+        # Erosion removes protrusions
+        eroded = cv2.erode(disk_slice, kernel, iterations=1)
+        # Dilation restores size but without sharp protrusions
+        normal_disk = cv2.dilate(eroded, kernel, iterations=1)
+        
+        # Find difference - potential protrusions
+        potential_protrusions = disk_slice.astype(bool) & (~normal_disk.astype(bool))
+        
+        if not np.any(potential_protrusions):
+            return np.zeros_like(disk_slice, dtype=bool)
+        
+        # Filter protrusions by direction toward canal
+        protrusion_coords = np.argwhere(potential_protrusions)
+        valid_protrusions = np.zeros_like(disk_slice, dtype=bool)
+        
+        for coord in protrusion_coords:
+            y, x = coord  # OpenCV uses (y, x)
+            
+            # Vector from disk center to protrusion point
+            to_protrusion = np.array([x - disk_center[0], y - disk_center[1]])
+            
+            if np.linalg.norm(to_protrusion) == 0:
+                continue
+                
+            to_protrusion = to_protrusion / np.linalg.norm(to_protrusion)
+            
+            # Check if protrusion is directed toward canal (cosine > 0.3)
+            dot_product = np.dot(direction, to_protrusion)
+            if dot_product > 0.3:  # angle less than ~70 degrees
+                valid_protrusions[y, x] = True
+        
+        # Remove small artifacts and isolated pixels
+        if np.sum(valid_protrusions) < 5:  # minimum protrusion size
+            return np.zeros_like(disk_slice, dtype=bool)
+        
+        # Morphological closing to connect nearby areas
+        close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        valid_protrusions = cv2.morphologyEx(valid_protrusions.astype(np.uint8), 
+                                            cv2.MORPH_CLOSE, close_kernel).astype(bool)
+        
+        return valid_protrusions
+
     def create_segmentation_object(self,
+                                  segmentation_data: np.ndarray,
+                                  reference_image_nifti,
+                                  study_id: str,
+                                  series_description: str = "Spine Segmentation") -> bytes:
+        """
+        Create basic DICOM Segmentation Object from segmentation mask (legacy method)
+        """
+        return self._create_segmentation_dicom(segmentation_data, reference_image_nifti, study_id, series_description)
+
+    def _create_segmentation_dicom(self,
                                   segmentation_data: np.ndarray,
                                   reference_image_nifti,
                                   study_id: str,
@@ -447,6 +664,8 @@ class DICOMReportGenerator:
                 # Special structures
                 1: {'name': 'Spinal_Cord', 'color': [0, 255, 255]},
                 2: {'name': 'Spinal_Canal', 'color': [255, 0, 0]},
+                # Pathological areas
+                999: {'name': 'Disc_Pathology', 'color': [255, 0, 0]},  # Red for pathologies
             }
             
             for idx, label in enumerate(sorted(unique_labels)):
@@ -773,10 +992,11 @@ def send_reports_to_orthanc(
                 # Extract segmentation data
                 seg_data = np.asanyarray(segmentation_nifti.dataobj).astype(np.uint8)
                 
-                seg_dicom_data = generator.create_segmentation_object(
+                seg_dicom_data = generator.create_enhanced_segmentation_object(
                     seg_data,
                     reference_image_nifti,
                     study_id,
+                    grading_results,
                     "AI Spine Segmentation"
                 )
                 results['seg_created'] = True
