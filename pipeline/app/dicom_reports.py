@@ -356,39 +356,65 @@ class DICOMReportGenerator:
             if grading_results:
                 from .config import settings
                 
+                logger.info(f"Processing grading results for pathological areas: {len(grading_results)} disks")
+                
                 # Find pathological disks
                 pathological_disks = set()
                 for disk_id, res in grading_results.items():
+                    logger.debug(f"Checking disk {disk_id}: {res}")
                     preds = res.get('predictions') if isinstance(res, dict) else None
                     if not isinstance(preds, dict):
+                        logger.debug(f"Disk {disk_id}: no predictions found")
                         continue
                         
                     # Check for herniation
                     hernia_val = preds.get('Disc herniation', 0)
                     if isinstance(hernia_val, list):
                         hernia_val = hernia_val[0] if len(hernia_val) > 0 else 0
+                    logger.debug(f"Disk {disk_id}: herniation value = {hernia_val}")
                     if hernia_val > 0:
                         pathological_disks.add(int(disk_id))
+                        logger.info(f"Disk {disk_id}: marked as pathological (herniation = {hernia_val})")
                         
                     # Check for bulging
                     bulge_val = preds.get('Disc bulging', 0)
                     if isinstance(bulge_val, list):
                         bulge_val = bulge_val[0] if len(bulge_val) > 0 else 0
+                    logger.debug(f"Disk {disk_id}: bulging value = {bulge_val}")
                     if bulge_val > 0:
                         pathological_disks.add(int(disk_id))
+                        logger.info(f"Disk {disk_id}: marked as pathological (bulging = {bulge_val})")
+                
+                logger.info(f"Found {len(pathological_disks)} pathological disks: {sorted(pathological_disks)}")
                 
                 # Compute pathological masks and add them to segmentation
                 if pathological_disks:
                     canal_label = settings.CANAL_LABEL
-                    pathology_label = 999  # Special label for pathological areas
+                    pathology_label = 200  # Special label for pathological areas (fits in uint8)
                     
                     logger.info(f"Adding pathological areas for disks: {sorted(pathological_disks)}")
+                    logger.info(f"Using canal label: {canal_label}")
+                    
+                    # Check if disks exist in segmentation
+                    unique_labels = np.unique(enhanced_seg_data)
+                    logger.info(f"Available labels in segmentation: {sorted(unique_labels.tolist())}")
                     
                     for disk_id in pathological_disks:
+                        if disk_id not in unique_labels:
+                            logger.warning(f"Disk {disk_id} not found in segmentation data")
+                            continue
+                            
+                        logger.info(f"Computing protrusion mask for disk {disk_id}")
                         protrusion_mask = self._compute_protrusion_mask(enhanced_seg_data, disk_id, canal_label)
                         if np.any(protrusion_mask):
                             enhanced_seg_data[protrusion_mask] = pathology_label
                             logger.info(f"Added {np.sum(protrusion_mask)} pathological voxels for disk {disk_id}")
+                        else:
+                            logger.warning(f"No pathological voxels found for disk {disk_id}")
+                else:
+                    logger.info("No pathological disks found")
+            else:
+                logger.info("No grading results provided for pathological area detection")
             
             return self._create_segmentation_dicom(enhanced_seg_data, reference_image_nifti, study_id, series_description)
             
@@ -665,7 +691,7 @@ class DICOMReportGenerator:
                 1: {'name': 'Spinal_Cord', 'color': [0, 255, 255]},
                 2: {'name': 'Spinal_Canal', 'color': [255, 0, 0]},
                 # Pathological areas
-                999: {'name': 'Disc_Pathology', 'color': [255, 0, 0]},  # Red for pathologies
+                200: {'name': 'Disc_Pathology', 'color': [255, 0, 0]},  # Red for pathologies
             }
             
             for idx, label in enumerate(sorted(unique_labels)):
