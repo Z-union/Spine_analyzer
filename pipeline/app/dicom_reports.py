@@ -329,6 +329,193 @@ class DICOMReportGenerator:
             file_ds.save_as(buffer, write_like_original=False)
             return buffer.getvalue()
     
+    def create_segmentation_object(self,
+                                  segmentation_data: np.ndarray,
+                                  reference_image_nifti,
+                                  study_id: str,
+                                  series_description: str = "Spine Segmentation") -> bytes:
+        """
+        Create DICOM Segmentation Object from segmentation mask
+        
+        Args:
+            segmentation_data: 3D numpy array with segmentation labels
+            reference_image_nifti: Reference NIfTI image for spatial information
+            study_id: Orthanc study ID
+            series_description: Description for the segmentation series
+            
+        Returns:
+            DICOM Segmentation Object as bytes
+        """
+        try:
+            # Create dataset
+            ds = Dataset()
+            
+            # Patient Module
+            ds.PatientName = self.study_info.get('PatientName', 'Anonymous')
+            ds.PatientID = self.study_info.get('PatientID', 'Unknown')
+            ds.PatientBirthDate = self.study_info.get('PatientBirthDate', '')
+            ds.PatientSex = self.study_info.get('PatientSex', '')
+            
+            # General Study Module
+            ds.StudyInstanceUID = self.study_info.get('StudyInstanceUID', generate_uid())
+            ds.StudyDate = self.study_info.get('StudyDate', datetime.now().strftime('%Y%m%d'))
+            ds.StudyTime = self.study_info.get('StudyTime', datetime.now().strftime('%H%M%S'))
+            ds.ReferringPhysicianName = self.study_info.get('ReferringPhysicianName', '')
+            ds.StudyID = self.study_info.get('StudyID', study_id)
+            ds.AccessionNumber = self.study_info.get('AccessionNumber', '')
+            
+            # General Series Module
+            ds.SeriesInstanceUID = generate_uid()
+            ds.SeriesNumber = 997  # High number for segmentation
+            ds.SeriesDate = datetime.now().strftime('%Y%m%d')
+            ds.SeriesTime = datetime.now().strftime('%H%M%S')
+            ds.Modality = 'SEG'  # Segmentation
+            ds.SeriesDescription = series_description
+            
+            # General Equipment Module
+            ds.Manufacturer = 'Spine Analyzer'
+            ds.InstitutionName = self.study_info.get('InstitutionName', '')
+            ds.StationName = 'AI Analysis Station'
+            ds.ManufacturerModelName = 'SpineAnalyzer v1.0'
+            ds.SoftwareVersions = '1.0.0'
+            
+            # General Image Module
+            ds.InstanceNumber = 1
+            ds.ImageType = ['DERIVED', 'PRIMARY', 'SEGMENTATION']
+            ds.ContentDate = datetime.now().strftime('%Y%m%d')
+            ds.ContentTime = datetime.now().strftime('%H%M%S')
+            
+            # Segmentation Image Module
+            ds.ImageType = ['DERIVED', 'PRIMARY']
+            ds.SamplesPerPixel = 1
+            ds.PhotometricInterpretation = 'MONOCHROME2'
+            ds.BitsAllocated = 8
+            ds.BitsStored = 8
+            ds.HighBit = 7
+            ds.PixelRepresentation = 0
+            
+            # Get dimensions from segmentation data
+            if len(segmentation_data.shape) == 3:
+                depth, height, width = segmentation_data.shape
+            else:
+                raise ValueError("Segmentation data must be 3D")
+            
+            ds.Rows = height
+            ds.Columns = width
+            ds.NumberOfFrames = depth
+            
+            # Image Position and Orientation from reference image
+            if hasattr(reference_image_nifti, 'affine'):
+                affine = reference_image_nifti.affine
+                # Extract position from affine matrix
+                ds.ImagePositionPatient = [float(affine[0, 3]), float(affine[1, 3]), float(affine[2, 3])]
+                # Extract orientation from affine matrix
+                row_cosines = affine[:3, 0] / np.linalg.norm(affine[:3, 0])
+                col_cosines = affine[:3, 1] / np.linalg.norm(affine[:3, 1])
+                ds.ImageOrientationPatient = [float(x) for x in list(row_cosines) + list(col_cosines)]
+                # Pixel spacing
+                ds.PixelSpacing = [float(np.linalg.norm(affine[:3, 1])), float(np.linalg.norm(affine[:3, 0]))]
+                ds.SliceThickness = float(np.linalg.norm(affine[:3, 2]))
+            else:
+                # Default values if no affine information
+                ds.ImagePositionPatient = [0.0, 0.0, 0.0]
+                ds.ImageOrientationPatient = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+                ds.PixelSpacing = [1.0, 1.0]
+                ds.SliceThickness = 1.0
+            
+            # Segmentation-specific attributes
+            ds.SegmentationType = 'BINARY'
+            ds.SegmentationFractionalType = 'PROBABILITY'
+            ds.MaximumFractionalValue = 255
+            
+            # Create Segment Sequence
+            segment_sequence = []
+            
+            # Get unique labels (excluding background)
+            unique_labels = np.unique(segmentation_data)
+            unique_labels = unique_labels[unique_labels != 0]
+            
+            # Define segment colors and names
+            segment_info = {
+                # Vertebrae
+                **{i: {'name': f'Vertebra_{i}', 'color': [0, 255, 0]} for i in range(11, 51)},
+                # Discs
+                63: {'name': 'Disc_Th12-L1', 'color': [255, 255, 0]},
+                71: {'name': 'Disc_L1-L2', 'color': [255, 255, 0]},
+                91: {'name': 'Disc_L4-L5', 'color': [255, 255, 0]},
+                100: {'name': 'Disc_L5-S1', 'color': [255, 255, 0]},
+                # Special structures
+                1: {'name': 'Spinal_Cord', 'color': [0, 255, 255]},
+                2: {'name': 'Spinal_Canal', 'color': [255, 0, 0]},
+            }
+            
+            for idx, label in enumerate(sorted(unique_labels)):
+                segment = Dataset()
+                segment.SegmentNumber = idx + 1
+                segment.SegmentLabel = segment_info.get(label, {'name': f'Structure_{label}'})['name']
+                segment.SegmentAlgorithmType = 'AUTOMATIC'
+                segment.SegmentAlgorithmName = 'SpineAnalyzer AI'
+                
+                # Segment color
+                color = segment_info.get(label, {'color': [128, 128, 128]})['color']
+                segment.RecommendedDisplayCIELabValue = color
+                
+                # Anatomical codes (simplified)
+                segment.SegmentedPropertyCategoryCodeSequence = [Dataset()]
+                segment.SegmentedPropertyCategoryCodeSequence[0].CodeValue = 'T-D0050'
+                segment.SegmentedPropertyCategoryCodeSequence[0].CodingSchemeDesignator = 'SRT'
+                segment.SegmentedPropertyCategoryCodeSequence[0].CodeMeaning = 'Tissue'
+                
+                segment.SegmentedPropertyTypeCodeSequence = [Dataset()]
+                segment.SegmentedPropertyTypeCodeSequence[0].CodeValue = 'T-D0050'
+                segment.SegmentedPropertyTypeCodeSequence[0].CodingSchemeDesignator = 'SRT'
+                segment.SegmentedPropertyTypeCodeSequence[0].CodeMeaning = 'Tissue'
+                
+                segment_sequence.append(segment)
+            
+            ds.SegmentSequence = segment_sequence
+            
+            # Convert segmentation data to binary masks and pack
+            # For simplicity, we'll create a multi-frame image where each frame contains all segments
+            # In a full implementation, you might want separate frames per segment
+            
+            # Normalize segmentation data to 0-255 range
+            seg_normalized = np.zeros_like(segmentation_data, dtype=np.uint8)
+            for i, label in enumerate(sorted(unique_labels)):
+                seg_normalized[segmentation_data == label] = min(255, (i + 1) * (255 // len(unique_labels)))
+            
+            # Reshape for DICOM (frames, rows, columns)
+            pixel_data = seg_normalized.astype(np.uint8)
+            ds.PixelData = pixel_data.tobytes()
+            
+            # SOP Common Module
+            ds.SOPClassUID = '1.2.840.10008.5.1.4.1.1.66.4'  # Segmentation Storage
+            ds.SOPInstanceUID = generate_uid()
+            
+            # Set transfer syntax
+            ds.is_implicit_VR = False
+            ds.is_little_endian = True
+            
+            # Create file meta information
+            file_meta = Dataset()
+            file_meta.MediaStorageSOPClassUID = ds.SOPClassUID
+            file_meta.MediaStorageSOPInstanceUID = ds.SOPInstanceUID
+            file_meta.ImplementationClassUID = generate_uid()
+            file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
+            
+            # Create FileDataset
+            filename = f"SEG_{datetime.now().strftime('%Y%m%d_%H%M%S')}.dcm"
+            file_ds = FileDataset(filename, ds, file_meta=file_meta, preamble=b"\0" * 128)
+            
+            # Save to bytes
+            with io.BytesIO() as buffer:
+                file_ds.save_as(buffer, write_like_original=False)
+                return buffer.getvalue()
+                
+        except Exception as e:
+            logger.error(f"Failed to create DICOM Segmentation Object: {e}")
+            raise
+
     def create_secondary_capture(self, 
                                 images: List[np.ndarray],
                                 study_id: str,
@@ -520,7 +707,9 @@ def send_reports_to_orthanc(
     study_id: str,
     grading_results: Dict,
     pathology_measurements: Dict,
-    segmentation_images: Any
+    segmentation_images: Any,
+    segmentation_nifti=None,
+    reference_image_nifti=None
 ) -> Dict[str, Any]:
     """
     Main function to create and send all reports to Orthanc
@@ -545,6 +734,8 @@ def send_reports_to_orthanc(
             'study_id': study_id,
             'sr_created': False,
             'sr_uploaded': False,
+            'seg_created': False,
+            'seg_uploaded': False,
             'sc_created': False,
             'sc_uploaded': False,
             'sc_count': 0,
@@ -574,6 +765,36 @@ def send_reports_to_orthanc(
             except Exception as e:
                 error_msg = f"SR upload failed: {str(e)}"
                 logger.error(f"Failed to upload SR for study {study_id}: {e}")
+                results['errors'].append(error_msg)
+
+        # Create and upload DICOM Segmentation Object if segmentation data is provided
+        if segmentation_nifti is not None and reference_image_nifti is not None:
+            try:
+                # Extract segmentation data
+                seg_data = np.asanyarray(segmentation_nifti.dataobj).astype(np.uint8)
+                
+                seg_dicom_data = generator.create_segmentation_object(
+                    seg_data,
+                    reference_image_nifti,
+                    study_id,
+                    "AI Spine Segmentation"
+                )
+                results['seg_created'] = True
+                logger.info(f"DICOM Segmentation Object created successfully for study {study_id}")
+                
+                try:
+                    seg_result = generator.upload_to_orthanc(seg_dicom_data, study_id)
+                    results['seg_uploaded'] = True
+                    results['seg_instance'] = seg_result.get('ID')
+                    logger.info(f"DICOM Segmentation Object uploaded successfully for study {study_id}")
+                except Exception as e:
+                    error_msg = f"Segmentation upload failed: {str(e)}"
+                    logger.error(f"Failed to upload Segmentation Object for study {study_id}: {e}")
+                    results['errors'].append(error_msg)
+                    
+            except Exception as e:
+                error_msg = f"Segmentation creation failed: {str(e)}"
+                logger.error(f"Failed to create Segmentation Object for study {study_id}: {e}")
                 results['errors'].append(error_msg)
 
         # Handle one or multiple overlay variants
@@ -647,6 +868,8 @@ def send_reports_to_orthanc(
             'study_id': study_id,
             'sr_created': False,
             'sr_uploaded': False,
+            'seg_created': False,
+            'seg_uploaded': False,
             'sc_created': False,
             'sc_uploaded': False,
             'errors': [f"Unexpected error: {str(e)}"]

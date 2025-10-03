@@ -58,11 +58,6 @@ class Settings(BaseSettings):
     MAX_SC_IMAGES: int = 50
     SC_IMAGE_QUALITY: int = 95
     
-    # Debug Options
-    DEBUG_MODE: bool = False
-    DEBUG_OUTPUT_DIR: str = "/tmp/spine_analyzer_debug"
-    SAVE_INTERMEDIATE_RESULTS: bool = False
-    
     # Disk Labels and Descriptions
     EXTRACT_LABELS_RANGE: list[int] = list(range(63, 101))
     VERTEBRA_DESCRIPTIONS: dict[int, str] = {
@@ -76,6 +71,12 @@ class Settings(BaseSettings):
     CANAL_LABEL: int = 2
 
     model_config = SettingsConfigDict(env_file=str(_ENV_PATH), env_file_encoding="utf-8")
+
+    # Debug Options
+    DEBUG_MODE: bool = True
+    DEBUG_OUTPUT_DIR: str = "/tmp/spine_analyzer_debug"
+    SAVE_INTERMEDIATE_RESULTS: bool = False
+    SPATIAL_TOLERANCE_MM: float = 1.0  # Допустимое расхождение в мм
 
 
 settings = Settings()
